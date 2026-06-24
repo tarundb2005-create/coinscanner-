@@ -38,17 +38,31 @@ import time
 import json
 import secrets
 import threading
+import logging
 from functools import wraps
 
 import redis
 import requests
+import sentry_sdk
+from sentry_sdk.integrations.flask import FlaskIntegration
+from sentry_sdk.integrations.logging import LoggingIntegration
+from sentry_sdk.integrations.redis import RedisIntegration
+try:
+    import firebase_admin
+    from firebase_admin import auth as firebase_auth, credentials as firebase_credentials
+except ImportError:
+    firebase_admin = None
+    firebase_auth = None
+    firebase_credentials = None
 from flask import (
     Flask, render_template, session, url_for,
-    request, redirect, jsonify, abort
+    request, redirect, jsonify, abort,
+    has_request_context, g
 )
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+from flask_talisman import Talisman
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import generate_password_hash, check_password_hash
 from concurrent.futures import ThreadPoolExecutor
@@ -70,10 +84,23 @@ def _env_flag(name, default=False):
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
+
+def _env_flag(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
 # ══════════════════════════════════════════════════════════
 # APP SETUP
 # ══════════════════════════════════════════════════════════
-app = Flask(__name__)
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+
+app = Flask(
+    __name__,
+    template_folder=os.path.join(BASE_DIR, "templates"),
+    static_folder=os.path.join(BASE_DIR, "static"),
+)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 application = app
 
@@ -112,7 +139,75 @@ if REDIS_URL:
         redis_client = redis.from_url(REDIS_URL, decode_responses=True)
     except Exception as e:
         app.logger.warning("Could not connect to Redis: %s", e)
+        try:
+            sentry_sdk.capture_exception(e)
+        except Exception:
+            pass
         redis_client = None
+
+
+SENTRY_DSN = os.getenv("SENTRY_DSN", "")
+SENTRY_ENVIRONMENT = os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("FLASK_ENV", "production")
+SENTRY_RELEASE = (
+    os.getenv("SENTRY_RELEASE")
+    or os.getenv("RAILWAY_GIT_COMMIT_SHA")
+    or os.getenv("HEROKU_SLUG_COMMIT_SHA")
+    or os.getenv("GIT_COMMIT_SHA")
+    or None
+)
+SENTRY_SENSITIVE_FIELDS = {
+    "password",
+    "otp",
+    "token",
+    "secret",
+    "authorization",
+    "api_key",
+    "apikey",
+    "access_token",
+    "refresh_token",
+}
+
+
+def _redact_sensitive_data(value):
+    if isinstance(value, dict):
+        return {
+            key: ("[REDACTED]" if key.lower() in SENTRY_SENSITIVE_FIELDS else _redact_sensitive_data(val))
+            for key, val in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_sensitive_data(item) for item in value]
+    return value
+
+
+def _sanitize_sentry_event(event, hint):
+    request_data = event.get("request")
+    if isinstance(request_data, dict):
+        if "data" in request_data and isinstance(request_data["data"], dict):
+            request_data["data"] = _redact_sensitive_data(request_data["data"])
+        if "headers" in request_data and isinstance(request_data["headers"], dict):
+            request_data["headers"] = {
+                key: ("[REDACTED]" if key.lower() in SENTRY_SENSITIVE_FIELDS else val)
+                for key, val in request_data["headers"].items()
+            }
+        event["request"] = request_data
+    return event
+
+
+if SENTRY_DSN:
+    sentry_sdk.init(
+        dsn=SENTRY_DSN,
+        integrations=[
+            FlaskIntegration(),
+            RedisIntegration(),
+            LoggingIntegration(level=logging.ERROR, event_level=logging.ERROR),
+        ],
+        traces_sample_rate=0.0,
+        environment=SENTRY_ENVIRONMENT,
+        release=SENTRY_RELEASE,
+        send_default_pii=False,
+        before_send=_sanitize_sentry_event,
+        attach_stacktrace=True,
+    )
 
 limiter = Limiter(
     key_func=get_remote_address,
@@ -121,10 +216,15 @@ limiter = Limiter(
 
 limiter.init_app(app)
 
-# ── CORS settings — restrict origins to production only.
+# ── CORS settings — allow only the configured frontend origin.
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
 CORS(
     app,
-    origins=[origin.strip() for origin in os.getenv("CORS_ALLOWED_ORIGINS", "https://yourdomain.com").split(",") if origin.strip()],
+    resources={
+        r"/*": {
+            "origins": [FRONTEND_URL],
+        }
+    },
     supports_credentials=True,
 )
 
@@ -137,6 +237,7 @@ NEWS_API_KEY   = os.getenv("NEWS_API_KEY")
 
 # Email sender address — override this in Render if you need a test sender
 EMAIL_FROM_ADDRESS = os.getenv("EMAIL_FROM_ADDRESS", "onboarding@resend.dev")
+RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 
 # MSG91 credentials — for SMS OTP delivery using MSG91
 MSG91_API_KEY    = os.getenv("MSG91_API_KEY")
@@ -144,29 +245,144 @@ MSG91_SENDER_ID  = os.getenv("MSG91_SENDER_ID", "MSGIND")
 MSG91_WIDGET_ID  = os.getenv("MSG91_WIDGET_ID")
 MSG91_TOKEN_AUTH = os.getenv("MSG91_TOKEN_AUTH")
 
+# Firebase admin credentials — used to verify Firebase ID tokens for email verification.
+FIREBASE_SERVICE_ACCOUNT = os.getenv("FIREBASE_SERVICE_ACCOUNT")
+FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID")
+
+FIREBASE_ADMIN_INITIALIZED = False
+if firebase_admin:
+    try:
+        if FIREBASE_SERVICE_ACCOUNT:
+            if FIREBASE_SERVICE_ACCOUNT.strip().startswith("{"):
+                cred = firebase_credentials.Certificate(json.loads(FIREBASE_SERVICE_ACCOUNT))
+            else:
+                cred = firebase_credentials.Certificate(FIREBASE_SERVICE_ACCOUNT)
+        else:
+            cred = firebase_credentials.ApplicationDefault()
+        firebase_admin.initialize_app(cred)
+        FIREBASE_ADMIN_INITIALIZED = True
+    except Exception as e:
+        app.logger.warning("Firebase admin init failed: %s", e)
+
 
 # ══════════════════════════════════════════════════════════════════
 # SECURITY HEADERS
 # Added to every HTTP response automatically.
 # These tell the browser to be extra careful about security.
 # ══════════════════════════════════════════════════════════
-@app.after_request
-def set_security_headers(response):
-    """
-    Add security headers to every response.
+TALISMAN_CSP = {
+    "default-src": ["'self'"],
+    "script-src": [
+        "'self'",
+        "'unsafe-inline'",
+        "https://www.gstatic.com",
+        "https://cdnjs.cloudflare.com",
+        "https://cdn.jsdelivr.net",
+    ],
+    "style-src": [
+        "'self'",
+        "'unsafe-inline'",
+        "https://fonts.googleapis.com",
+        "https://cdnjs.cloudflare.com",
+    ],
+    "font-src": [
+        "'self'",
+        "https://fonts.gstatic.com",
+        "data:",
+    ],
+    "img-src": [
+        "'self'",
+        "data:",
+    ],
+    "connect-src": [
+        "'self'",
+        "https://www.googleapis.com",
+        "https://securetoken.googleapis.com",
+        "https://identitytoolkit.googleapis.com",
+        "https://firebase.googleapis.com",
+        "https://www.gstatic.com",
+    ],
+    "frame-src": [
+        "'self'",
+        "https://www.gstatic.com",
+    ],
+    "object-src": ["'none'"],
+    "base-uri": ["'self'"],
+    "form-action": ["'self'"],
+}
 
-    X-Content-Type-Options: Stops browser from guessing file types.
-    X-Frame-Options:        Prevents the site being embedded in iframes
-                            (clickjacking protection).
-    Referrer-Policy:        Controls how much info is sent when clicking links.
+Talisman(
+    app,
+    content_security_policy=TALISMAN_CSP,
+    content_security_policy_nonce_in=["script-src", "style-src"],
+    force_https=app.config['SESSION_COOKIE_SECURE'],
+    strict_transport_security=True,
+    strict_transport_security_preload=False,
+    strict_transport_security_max_age=31536000,
+    frame_options="DENY",
+    referrer_policy="strict-origin-when-cross-origin",
+    permissions_policy={
+        "camera": "()",
+        "microphone": "()",
+        "geolocation": "()",
+    },
+)
+
+
+# ══════════════════════════════════════════════════════════
+# HEALTH CHECK ENDPOINTS
+# Production-grade readiness and dependency diagnostics.
+# ══════════════════════════════════════════════════
+
+@app.route("/health", methods=["GET"])
+def health():
     """
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"]        = "SAMEORIGIN"
-    response.headers["Referrer-Policy"]        = "strict-origin-when-cross-origin"
-    response.headers["Permissions-Policy"]     = "camera=(), microphone=(), geolocation=()"
-    if request.is_secure or app.config['SESSION_COOKIE_SECURE']:
-        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-    return response
+    Liveness probe.
+
+    Returns 200 when the application is running.
+    """
+    return jsonify({"status": "healthy"}), 200
+
+
+@app.route("/health/db", methods=["GET"])
+def health_db():
+    """
+    Database connectivity check.
+
+    Validates the configured database connection by executing a lightweight query.
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1")
+        cursor.fetchone()
+        conn.close()
+        return jsonify({"status": "healthy"}), 200
+    except Exception as e:
+        app.logger.error("Health DB check failed: %s", e)
+        return jsonify({"status": "unhealthy", "error": "database connection failed"}), 503
+
+
+@app.route("/health/redis", methods=["GET"])
+def health_redis():
+    """
+    Redis connectivity check.
+
+    Validates that Redis is configured and responds to a PING.
+    """
+    if not REDIS_URL:
+        return jsonify({"status": "unhealthy", "error": "redis not configured"}), 503
+
+    if not redis_client:
+        return jsonify({"status": "unhealthy", "error": "redis unavailable"}), 503
+
+    try:
+        if redis_client.ping():
+            return jsonify({"status": "healthy"}), 200
+    except Exception as e:
+        app.logger.error("Health Redis check failed: %s", e)
+
+    return jsonify({"status": "unhealthy", "error": "redis connection failed"}), 503
 
 
 # ══════════════════════════════════════════════════════════
@@ -896,10 +1112,10 @@ def login_required(f):
             try:
                 conn  = get_db_connection()
                 row   = conn.execute(
-                    "SELECT session_version FROM users WHERE id = %s", (uid,)
+                    "SELECT session_version, status FROM users WHERE id = %s", (uid,)
                 ).fetchone()
                 conn.close()
-                if not row or row["session_version"] != sv:
+                if not row or row["session_version"] != sv or row["status"] != "active":
                     session.clear()
                     return redirect(url_for("login", next=request.path))
             except Exception:
@@ -1533,8 +1749,68 @@ def send_otp_sms(phone, otp, purpose="signup"):
     return
 
 
+def _firebase_verify_email_token(id_token):
+    if not FIREBASE_ADMIN_INITIALIZED:
+        return None
+    try:
+        decoded = firebase_auth.verify_id_token(id_token)
+        if decoded.get("email_verified"):
+            return decoded.get("email")
+        uid = decoded.get("uid")
+        if uid:
+            user = firebase_auth.get_user(uid)
+            if user.email_verified:
+                return user.email
+        return None
+    except Exception as e:
+        app.logger.warning("Firebase token verification failed: %s", e)
+        return None
+
+
+def _verify_msg91_otp(phone, otp):
+    digits = "".join(ch for ch in phone if ch.isdigit())
+    if digits.startswith("91") and len(digits) == 12:
+        digits = digits[2:]
+    elif digits.startswith("0") and len(digits) == 11:
+        digits = digits[1:]
+
+    if len(digits) != 10:
+        app.logger.warning("MSG91 verify phone format invalid: %s", phone)
+        return False
+
+    try:
+        res = requests.get(
+            "https://control.msg91.com/api/verifyRequestOTP.php",
+            params={
+                "authkey": MSG91_API_KEY,
+                "mobile": digits,
+                "otp": otp,
+                "country": "91",
+            },
+            timeout=10
+        )
+        body = res.text.strip().lower()
+        if res.status_code == 200 and "success" in body:
+            return True
+        app.logger.warning(
+            "MSG91 OTP verification failed for %s: %s %s",
+            phone,
+            res.status_code,
+            res.text,
+        )
+    except Exception as e:
+        app.logger.error("MSG91 OTP verification error for %s: %s", phone, e)
+    return False
+
+
 def _build_otp_key(category, identifier):
     return f"otp:{category}:{identifier.strip().lower()}"
+
+
+# OTP storage uses Redis when available, otherwise a process-local cache.
+# OTPs are never persisted to the users database.
+_otp_cache = {}
+_otp_cache_lock = threading.Lock()
 
 
 def _generate_otp():
@@ -1542,26 +1818,44 @@ def _generate_otp():
 
 
 def _store_otp(category, identifier, otp):
-    if not redis_client:
-        return False
     key = _build_otp_key(category, identifier)
     otp_hash = generate_password_hash(otp)
-    redis_client.setex(key, 300, otp_hash)
+    if redis_client:
+        redis_client.setex(key, 300, otp_hash)
+    else:
+        with _otp_cache_lock:
+            _otp_cache[key] = {
+                "hash": otp_hash,
+                "expires_at": int(time.time()) + 300,
+            }
     return True
 
 
 def _verify_otp(category, identifier, entered):
-    if not redis_client:
-        return None
+    if not entered:
+        return False
+
     key = _build_otp_key(category, identifier)
-    stored = redis_client.get(key)
+    stored = None
+    if redis_client:
+        stored = redis_client.get(key)
+    else:
+        with _otp_cache_lock:
+            entry = _otp_cache.get(key)
+        if entry and entry["expires_at"] > int(time.time()):
+            stored = entry["hash"]
+
     if not stored:
         return False
     if isinstance(stored, bytes):
-        stored = stored.decode()
+        stored = stored.decode("utf-8")
     valid = check_password_hash(stored, entered)
     if valid:
-        redis_client.delete(key)
+        if redis_client:
+            redis_client.delete(key)
+        else:
+            with _otp_cache_lock:
+                _otp_cache.pop(key, None)
     return valid
 
 
@@ -1647,6 +1941,21 @@ def login():
                     return redirect(url_for("signup", email=identifier))
                 return redirect(url_for("signup", phone=identifier))
 
+            elif user["status"] == "deleted":
+                conn.close()
+                log_login_attempt(ip, identifier, False, "deleted")
+                error = "This account has been deleted."
+
+            elif user["status"] == "suspended":
+                conn.close()
+                log_login_attempt(ip, identifier, False, "suspended")
+                error = "Your account has been suspended. Please contact support."
+
+            elif user["status"] != "active":
+                conn.close()
+                log_login_attempt(ip, identifier, False, "pending")
+                error = "Please verify your email and phone before logging in."
+
             elif (user["locked_until"] or 0) > int(time.time()):
                 # Account is temporarily locked
                 remaining = int(((user["locked_until"] or 0) - time.time()) / 60) + 1
@@ -1716,7 +2025,7 @@ def signup():
     Generates two separate OTPs:
       - email_otp  → sent to email via Resend
       - phone_otp  → sent to phone via MSG91
-    Stored in Redis when available, with DB fallback for local development.
+    OTPs are stored in Redis when available and never persisted to the database.
     """
     if session.get("user_id"):
         return redirect(url_for("home"))
@@ -1743,73 +2052,54 @@ def signup():
 
             # Step 1 — check verified duplicates FIRST, before touching anything
             cursor.execute(
-                "SELECT id FROM users WHERE email = %s AND is_verified = 1 LIMIT 1",
-                (email,)
+                "SELECT status FROM users WHERE email = %s OR phone = %s",
+                (email, phone)
             )
-            if cursor.fetchone():
-                conn.close()
-                error = "An account with this email already exists."
-            else:
-                cursor.execute(
-                    "SELECT id FROM users WHERE phone = %s AND is_verified = 1 LIMIT 1",
-                    (phone,)
-                )
-                if cursor.fetchone():
+            existing_accounts = cursor.fetchall()
+            for existing in existing_accounts:
+                if existing["status"] == "active":
                     conn.close()
-                    error = "An account with this mobile number already exists."
-                else:
-                    # Step 2 — no verified account found, safe to clean up stale rows
+                    error = "An account with this email or phone already exists."
+                    break
+                if existing["status"] == "suspended":
+                    conn.close()
+                    error = "An account with this email or phone has been suspended."
+                    break
+
+            if not error:
+                # Step 2 — remove pending/deleted duplicate rows for this signup
+                cursor.execute(
+                    "DELETE FROM users WHERE (email = %s OR phone = %s) AND status != 'active'",
+                    (email, phone)
+                )
+                conn.commit()
+
+                # Step 3 — create new account
+                hashed_pw = generate_password_hash(password, method="pbkdf2:sha256")
+
+                email_otp = _generate_otp()
+                phone_otp = _generate_otp()
+                while phone_otp == email_otp:
+                    phone_otp = _generate_otp()
+
+                try:
                     cursor.execute(
-                        "DELETE FROM users WHERE (email = %s OR phone = %s) AND is_verified = 0",
-                        (email, phone)
+                        "INSERT INTO users (name, email, phone, password_hash) VALUES (%s, %s, %s, %s)",
+                        (name, email, phone, hashed_pw)
                     )
                     conn.commit()
+                except Exception as e:
+                    error = "Could not create account. Please try again."
+                    app.logger.error("Signup insert error: %s", e)
+                finally:
+                    conn.close()
 
-                    # Step 3 — create new account
-                    hashed_pw = generate_password_hash(password, method="pbkdf2:sha256")
-                    expiry    = int(time.time()) + 300
-
-                    email_otp = _generate_otp()
-                    phone_otp = _generate_otp()
-                    while phone_otp == email_otp:
-                        phone_otp = _generate_otp()
-
-                    if _store_otp("email", email, email_otp):
-                        stored_email_otp = None
-                        stored_email_otp_expiry = None
-                    else:
-                        stored_email_otp = email_otp
-                        stored_email_otp_expiry = expiry
-
-                    if _store_otp("phone", phone, phone_otp):
-                        stored_phone_otp = None
-                        stored_phone_otp_expiry = None
-                    else:
-                        stored_phone_otp = phone_otp
-                        stored_phone_otp_expiry = expiry
-
-                    try:
-                        cursor.execute(
-                            "INSERT INTO users "
-                            "(name, email, phone, password_hash, "
-                            " email_otp, email_otp_expiry, "
-                            " phone_otp, phone_otp_expiry) "
-                               "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                               (name, email, phone, hashed_pw,
-                                stored_email_otp, stored_email_otp_expiry,
-                                stored_phone_otp, stored_phone_otp_expiry)
-                        )
-                        conn.commit()
-                    except Exception as e:
-                        error = "Could not create account. Please try again."
-                        app.logger.error("Signup insert error: %s", e)
-                    finally:
-                        conn.close()
-
-                    if not error:
-                        send_otp_email(email, email_otp, purpose="signup")
-                        send_otp_sms(phone, phone_otp, purpose="signup")
-                        return redirect(url_for("verify_email", email=email))
+                if not error:
+                    send_otp_email(email, email_otp, purpose="signup")
+                    send_otp_sms(phone, phone_otp, purpose="signup")
+                    return redirect(url_for("verify_email", email=email))
+            else:
+                conn.close()
 
     return render_template("auth/signup.html", error=error,
         form_name=request.form.get("name", request.args.get("name", "")),
@@ -1847,25 +2137,40 @@ def verify_email():
             conn.close()
             return redirect(url_for("signup"))
 
+        if user["status"] == "deleted":
+            conn.close()
+            return redirect(url_for("signup"))
+
+        if user["status"] == "suspended":
+            conn.close()
+            return redirect(url_for("login"))
+
+        if user["status"] == "active":
+            conn.close()
+            return redirect(url_for("home"))
+
         if not entered:
             error = "Please enter the OTP."
-        elif redis_client:
-            valid = _verify_otp("email", email, entered)
-            if not valid:
-                error = "Incorrect OTP. Please try again."
-        elif int(time.time()) > (user["email_otp_expiry"] or 0):
-            error = "OTP has expired. Please sign up again."
-        elif user["email_otp"] != entered:
-            error = "Incorrect OTP. Please try again."
         else:
-            cursor.execute(
-                "UPDATE users SET email_verified = 1, email_otp = NULL, email_otp_expiry = NULL"
-                " WHERE email = %s",
-                (email,)
-            )
-            conn.commit()
-            conn.close()
-            return redirect(url_for("verify_phone", email=email))
+            firebase_token = request.form.get("firebase_token", "").strip()
+            valid = False
+            if firebase_token:
+                verified_email = _firebase_verify_email_token(firebase_token)
+                valid = bool(verified_email and verified_email.lower() == email.lower())
+            else:
+                valid = _verify_otp("email", email, entered)
+
+            if not valid:
+                error = "Email verification failed. Please try again."
+            else:
+                cursor.execute(
+                    "UPDATE users SET email_verified = TRUE, status = CASE WHEN phone_verified IS TRUE THEN 'active' ELSE 'pending' END "
+                    "WHERE email = %s",
+                    (email,)
+                )
+                conn.commit()
+                conn.close()
+                return redirect(url_for("verify_phone", email=email))
 
         conn.close()
 
@@ -1899,18 +2204,20 @@ def resend_email_otp():
         conn.close()
         return redirect(url_for("signup"))
 
-    if user["email_verified"]:
+    if user["status"] == "deleted":
         conn.close()
-        return redirect(url_for("verify_phone", email=email))
+        return redirect(url_for("signup"))
 
-    otp    = _generate_otp()
-    expiry = int(time.time()) + 300
-    if not _store_otp("email", email, otp):
-        cursor.execute(
-            "UPDATE users SET email_otp = %s, email_otp_expiry = %s WHERE email = %s",
-            (otp, expiry, email)
-        )
-        conn.commit()
+    if user["status"] == "active":
+        conn.close()
+        return redirect(url_for("home"))
+
+    if user["status"] == "suspended":
+        conn.close()
+        return redirect(url_for("login"))
+
+    otp = _generate_otp()
+    _store_otp("email", email, otp)
     conn.close()
 
     send_otp_email(email, otp, purpose="signup")
@@ -1940,6 +2247,14 @@ def verify_phone():
             conn.close()
             return redirect(url_for("signup"))
 
+        if user["status"] == "deleted":
+            conn.close()
+            return redirect(url_for("signup"))
+
+        if user["status"] == "suspended":
+            conn.close()
+            return redirect(url_for("login"))
+
         # Make sure email was verified first
         if not user["email_verified"]:
             conn.close()
@@ -1947,30 +2262,29 @@ def verify_phone():
 
         if not entered:
             error = "Please enter the OTP."
-        elif redis_client:
-            if not _verify_otp("phone", email, entered):
-                error = "Incorrect OTP. Please try again."
-        elif int(time.time()) > (user["phone_otp_expiry"] or 0):
-            error = "OTP has expired. Please sign up again."
-        elif user["phone_otp"] != entered:
-            error = "Incorrect OTP. Please try again."
         else:
-            # Both verified — mark account active
-            cursor.execute(
-                "UPDATE users SET phone_verified = 1, is_verified = 1,"
-                " phone_otp = NULL, phone_otp_expiry = NULL"
-                " WHERE email = %s",
-                (email,)
-            )
-            conn.commit()
+            if MSG91_API_KEY:
+                valid = _verify_msg91_otp(user["phone"], entered)
+            else:
+                valid = _verify_otp("phone", user["phone"], entered)
 
-            # Auto-login — no need to go to login page
-            session.clear()
-            session["user_id"]    = user["id"]
-            session["user_email"] = user["email"]
-            session["sv"]         = user["session_version"] or 0
-            conn.close()
-            return redirect(url_for("home"))
+            if not valid:
+                error = "Incorrect OTP. Please try again."
+            else:
+                cursor.execute(
+                    "UPDATE users SET phone_verified = TRUE, status = CASE WHEN email_verified IS TRUE THEN 'active' ELSE 'pending' END "
+                    "WHERE email = %s",
+                    (email,)
+                )
+                conn.commit()
+
+                # Auto-login — no need to go to login page
+                session.clear()
+                session["user_id"]    = user["id"]
+                session["user_email"] = user["email"]
+                session["sv"]         = user["session_version"] or 0
+                conn.close()
+                return redirect(url_for("home"))
 
         conn.close()
 
@@ -1982,14 +2296,8 @@ def verify_phone():
 
     success = None
     if request.args.get("resend") and row and row["phone"] and row["email_verified"]:
-        otp    = _generate_otp()
-        expiry = int(time.time()) + 300
-        if not _store_otp("phone", row["phone"], otp):
-            cursor.execute(
-                "UPDATE users SET phone_otp = %s, phone_otp_expiry = %s WHERE email = %s",
-                (otp, expiry, email)
-            )
-            conn.commit()
+        otp = _generate_otp()
+        _store_otp("phone", row["phone"], otp)
         send_otp_sms(row["phone"], otp, purpose="signup")
         success = "A new OTP has been sent to your mobile."
 
@@ -2071,14 +2379,8 @@ def forgot_password():
 
             if user:
                 # Account found — generate OTP and send via email
-                otp    = _generate_otp()
-                expiry = int(time.time()) + 300
-                if not _store_otp("reset", identifier, otp):
-                    cursor.execute(
-                        "UPDATE users SET otp_code = %s, otp_expiry = %s WHERE id = %s",
-                        (otp, expiry, user["id"])
-                    )
-                    conn.commit()
+                otp = _generate_otp()
+                _store_otp("reset", identifier, otp)
                 send_otp_email(identifier, otp, purpose="reset")
             # No else — silently do nothing if account doesn't exist
 
@@ -2088,7 +2390,6 @@ def forgot_password():
     return render_template("auth/forgot_password.html", error=error)
 
 
-@app.route("/verify-reset-otp", methods=["GET", "POST"])
 @app.route("/verify-reset-otp", methods=["GET", "POST"])
 @limiter.limit("5 per minute")
 def verify_reset_otp():
@@ -2121,12 +2422,7 @@ def verify_reset_otp():
 
         if not entered_otp:
             error = "Please enter the OTP."
-        elif redis_client is not None:
-            if not _verify_otp("reset", identifier, entered_otp):
-                error = "Incorrect OTP. Please try again."
-        elif int(time.time()) > (user["otp_expiry"] or 0):
-            error = "OTP has expired. Please request a new one."
-        elif user["otp_code"] != entered_otp:
+        elif not _verify_otp("reset", identifier, entered_otp):
             error = "Incorrect OTP. Please try again."
         else:
             # ✅ OTP verified — let them set a new password
@@ -2142,7 +2438,6 @@ def verify_reset_otp():
 
 
 @app.route("/resend-reset-otp", methods=["POST"])
-@app.route("/resend-reset-otp", methods=["POST"])
 @limiter.limit("5 per minute")
 def resend_reset_otp():
     """
@@ -2153,17 +2448,8 @@ def resend_reset_otp():
     if not identifier:
         return redirect(url_for("forgot_password"))
 
-    otp    = _generate_otp()
-    expiry = int(time.time()) + 300
-    conn   = get_db_connection()
-    cursor = conn.cursor()
-    if not _store_otp("reset", identifier, otp):
-        cursor.execute(
-            "UPDATE users SET otp_code = %s, otp_expiry = %s WHERE email = %s OR phone = %s",
-            (otp, expiry, identifier, identifier)
-        )
-        conn.commit()
-    conn.close()
+    otp = _generate_otp()
+    _store_otp("reset", identifier, otp)
     send_otp_email(identifier, otp, purpose="reset")
     return redirect(url_for("verify_reset_otp"))
 
@@ -2196,8 +2482,7 @@ def reset_password():
             conn   = get_db_connection()
             cursor = conn.cursor()
             cursor.execute(
-                "UPDATE users SET password_hash = %s, otp_code = NULL, otp_expiry = NULL,"
-                " session_version = session_version + 1"
+                "UPDATE users SET password_hash = %s, session_version = session_version + 1"
                 " WHERE id = %s",
                 (generate_password_hash(new_pw, method="pbkdf2:sha256"), user_id)
             )

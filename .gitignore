@@ -1,5 +1,6 @@
 # Python
 __pycache__/
+**/__pycache__/
 *.py[cod]
 *.pyo
 *.pyd
@@ -15,7 +16,6 @@ __pycache__/
 
 # Python artifacts
 *.pyc
-__pycache__/
 instance/
 
 # macOS
@@ -51,6 +51,7 @@ htmlcov/
 .coverage.*
 
 # AWS / deployment
+.git/
 .elasticbeanstalk/
 *.deploy*
 
