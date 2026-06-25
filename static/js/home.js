@@ -755,20 +755,21 @@ document.addEventListener("DOMContentLoaded", function () {
  */
 async function loadMarketStats() {
   try {
-    const res = await fetch("https://api.coingecko.com/api/v3/global");
+    const res = await fetch("/api/market-stats");
     if (!res.ok) return;
-    const { data } = await res.json();
+    const data = await res.json();
+    if (!data.ok) return;
 
     window._globalStats = {
-      total_market_cap_usd:             data.total_market_cap?.usd                  || 0,
-      total_market_cap_inr:             data.total_market_cap?.inr                  || 0,
-      total_volume_usd:                 data.total_volume?.usd                      || 0,
-      total_volume_inr:                 data.total_volume?.inr                      || 0,
-      btc_dominance:                    data.market_cap_percentage?.btc             || 0,
-      eth_dominance:                    data.market_cap_percentage?.eth             || 0,
-      active_coins:                     data.active_cryptocurrencies               || 0,
-      markets:                          data.markets                               || 0,
-      market_cap_change_percentage_24h: data.market_cap_change_percentage_24h_usd  || 0,
+      total_market_cap_usd:             data.total_market_cap_usd              || 0,
+      total_market_cap_inr:             data.total_market_cap_inr              || 0,
+      total_volume_usd:                 data.total_volume_usd                  || 0,
+      total_volume_inr:                 data.total_volume_inr                  || 0,
+      btc_dominance:                    data.btc_dominance                     || 0,
+      eth_dominance:                    data.eth_dominance                     || 0,
+      active_coins:                     data.active_coins                      || 0,
+      markets:                          data.markets                           || 0,
+      market_cap_change_percentage_24h: data.market_cap_change_percentage_24h  || 0,
       market_cap_breakdown:             buildMarketCapBreakdown(data.market_cap_percentage || {}),
     };
 
@@ -800,18 +801,18 @@ async function loadTrendingStrip() {
   if (!container) return;
 
   try {
-    const res   = await fetch("https://api.coingecko.com/api/v3/search/trending");
+    const res  = await fetch("/api/trending");
     if (!res.ok) return;
-    const data  = await res.json();
-    const coins = data.coins.slice(0, 8);
+    const data = await res.json();
+    const coins = (data.coins || []).slice(0, 8);
 
-    container.innerHTML = coins.map(function (item, i) {
-      const c      = item.item;
-      const change = c.data?.price_change_percentage_24h?.usd;
+    if (!coins.length) throw new Error("no coins");
+
+    container.innerHTML = coins.map(function (c, i) {
+      const change = c.change;
       const chgStr = change != null
         ? `<span class="trend-chip-chg ${change >= 0 ? "up" : "dn"}">${change >= 0 ? "▲" : "▼"} ${Math.abs(change).toFixed(1)}%</span>`
         : "";
-      // Use symbol (e.g. "BTC") for URL — our coin detail page uses DCX symbols
       const sym = (c.symbol || "").toUpperCase();
       return `
         <a href="/coin/${sym}" class="trend-chip">

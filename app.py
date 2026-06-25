@@ -719,7 +719,8 @@ def get_coin_metadata():
             "GALA":"https://assets.coingecko.com/coins/images/12493/small/GALA-COINGECKO.png",
             "BLUR":"https://assets.coingecko.com/coins/images/28453/small/blur.png",
         }
-        image = LOGO_MAP.get(symbol, f"https://assets.coincap.io/assets/icons/{symbol.lower()}@2x.png")
+        # CryptoCompare CDN is reliable and doesn't rate-limit image requests
+        image = LOGO_MAP.get(symbol, f"https://www.cryptocompare.com/media/37746251/{symbol.lower()}.png")
 
         meta_map[symbol] = {
             "id":                 symbol,
@@ -780,12 +781,16 @@ def get_global_stats():
         return GLOBAL_CACHE["data"]
 
     stats = {
-        "total_market_cap_inr": raw.get("total_market_cap", {}).get("inr", 0),
-        "total_market_cap_usd": raw.get("total_market_cap", {}).get("usd", 0),
-        "total_volume_inr":     raw.get("total_volume",     {}).get("inr", 0),
-        "btc_dominance":        round(raw.get("market_cap_percentage", {}).get("btc", 0), 1),
-        "active_coins":         raw.get("active_cryptocurrencies", 0),
-        "markets":              raw.get("markets", 0),
+        "total_market_cap_inr":              raw.get("total_market_cap", {}).get("inr", 0),
+        "total_market_cap_usd":              raw.get("total_market_cap", {}).get("usd", 0),
+        "total_volume_inr":                  raw.get("total_volume",     {}).get("inr", 0),
+        "total_volume_usd":                  raw.get("total_volume",     {}).get("usd", 0),
+        "btc_dominance":                     round(raw.get("market_cap_percentage", {}).get("btc", 0), 1),
+        "eth_dominance":                     round(raw.get("market_cap_percentage", {}).get("eth", 0), 1),
+        "active_coins":                      raw.get("active_cryptocurrencies", 0),
+        "markets":                           raw.get("markets", 0),
+        "market_cap_change_percentage_24h":  raw.get("market_cap_change_percentage_24h_usd", 0),
+        "market_cap_percentage":             raw.get("market_cap_percentage", {}),
     }
 
     if redis_client is not None:
@@ -1293,6 +1298,82 @@ def debug_dcx():
         results["candles"] = {"error": str(e)}
 
     return jsonify(results)
+
+
+@app.route("/api/market-stats")
+def api_market_stats():
+    """
+    Server-side proxy for global crypto market statistics.
+
+    Returns cached data from get_global_stats() in a format that
+    home.js renderHeroBand() expects. This avoids the browser hitting
+    CoinGecko directly (which gets rate-limited / blocked).
+    """
+    stats = get_global_stats()
+    return jsonify({
+        "ok":                             True,
+        "total_market_cap_usd":           stats.get("total_market_cap_usd", 0),
+        "total_market_cap_inr":           stats.get("total_market_cap_inr", 0),
+        "total_volume_usd":               stats.get("total_volume_usd", 0),
+        "total_volume_inr":               stats.get("total_volume_inr", 0),
+        "btc_dominance":                  stats.get("btc_dominance", 0),
+        "eth_dominance":                  stats.get("eth_dominance", 0),
+        "active_coins":                   stats.get("active_coins", 0),
+        "markets":                        stats.get("markets", 0),
+        "market_cap_change_percentage_24h": stats.get("market_cap_change_percentage_24h", 0),
+        "market_cap_percentage":          stats.get("market_cap_percentage", {}),
+    })
+
+
+# Simple in-memory cache for trending (5 min TTL)
+_trending_cache = {"data": [], "timestamp": 0}
+_trending_lock  = threading.Lock()
+
+@app.route("/api/trending")
+def api_trending():
+    """
+    Server-side proxy for trending coins from CoinGecko.
+
+    Cached for 5 minutes so we don't hit CoinGecko on every page load.
+    Browser fetches from /api/trending instead of CoinGecko directly,
+    avoiding browser-side rate limits.
+    """
+    global _trending_cache
+    with _trending_lock:
+        if time.time() - _trending_cache["timestamp"] < 300 and _trending_cache["data"]:
+            return jsonify({"ok": True, "coins": _trending_cache["data"]})
+
+    try:
+        res = requests.get(
+            "https://api.coingecko.com/api/v3/search/trending",
+            timeout=10,
+        )
+        res.raise_for_status()
+        raw    = res.json()
+        coins  = [
+            {
+                "id":     item["item"].get("id", ""),
+                "name":   item["item"].get("name", ""),
+                "symbol": item["item"].get("symbol", ""),
+                "small":  item["item"].get("small", ""),
+                "change": (
+                    item["item"].get("data", {})
+                          .get("price_change_percentage_24h", {})
+                          .get("usd", None)
+                ),
+            }
+            for item in raw.get("coins", [])[:8]
+        ]
+        with _trending_lock:
+            _trending_cache = {"data": coins, "timestamp": time.time()}
+        return jsonify({"ok": True, "coins": coins})
+    except Exception as e:
+        app.logger.warning("Trending fetch error: %s", e)
+        # Return stale cache if available
+        with _trending_lock:
+            if _trending_cache["data"]:
+                return jsonify({"ok": True, "coins": _trending_cache["data"]})
+        return jsonify({"ok": False, "coins": []}), 200
 
 
 @app.route("/api/coins")

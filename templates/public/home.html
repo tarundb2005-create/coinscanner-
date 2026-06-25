@@ -40,35 +40,70 @@
 
     <!-- ② HERO BAND — mood pill + market stats -->
     <div class="hero-band" id="heroBand">
-        <div class="hero-mood" id="heroMood">
-            <div class="mood-dot" id="moodDot"></div>
-            <span id="moodText">Loading market...</span>
+        <div class="hero-mood {% if global_stats and global_stats.market_cap_change_percentage_24h is defined and global_stats.market_cap_change_percentage_24h < 0 %}down{% endif %}" id="heroMood">
+            <div class="mood-dot" id="moodDot"
+                 style="background:{% if global_stats and global_stats.market_cap_change_percentage_24h is defined %}{% if global_stats.market_cap_change_percentage_24h >= 0 %}#22C55E{% else %}#DC2626{% endif %}{% else %}#94A3B8{% endif %};"></div>
+            <span id="moodText">
+                {%- if global_stats and global_stats.market_cap_change_percentage_24h is defined -%}
+                    {%- if global_stats.market_cap_change_percentage_24h >= 0 -%}
+                        Market is up {{ (global_stats.market_cap_change_percentage_24h | abs) | round(1) }}% today
+                    {%- else -%}
+                        Market is down {{ (global_stats.market_cap_change_percentage_24h | abs) | round(1) }}% today
+                    {%- endif -%}
+                {%- else -%}
+                    Market data unavailable
+                {%- endif -%}
+            </span>
         </div>
         <div class="hero-band-div"></div>
         <div class="hero-stats">
             <div class="hstat marketcap-card" id="heroMktCapCard" role="button" tabindex="0" title="Click to view market cap breakdown">
                 <span class="hstat-label">Market Cap</span>
-                <span class="hstat-value" id="heroMktCap">—</span>
-                <span class="hstat-chg" id="heroMktCapChg"></span>
+                <span class="hstat-value" id="heroMktCap">
+                    {%- if global_stats and global_stats.total_market_cap_inr -%}
+                        ₹{{ (global_stats.total_market_cap_inr / 1e13) | round(2) }} L.Cr
+                    {%- else -%}—{%- endif -%}
+                </span>
+                <span class="hstat-chg {% if global_stats and global_stats.market_cap_change_percentage_24h is defined and global_stats.market_cap_change_percentage_24h >= 0 %}up{% else %}dn{% endif %}" id="heroMktCapChg">
+                    {%- if global_stats and global_stats.market_cap_change_percentage_24h is defined -%}
+                        {{ "▲" if global_stats.market_cap_change_percentage_24h >= 0 else "▼" }} {{ (global_stats.market_cap_change_percentage_24h | abs) | round(1) }}%
+                    {%- endif -%}
+                </span>
             </div>
             <div class="hstat">
                 <span class="hstat-label">24h Volume</span>
-                <span class="hstat-value" id="heroVolume">—</span>
+                <span class="hstat-value" id="heroVolume">
+                    {%- if global_stats and global_stats.total_volume_inr -%}
+                        ₹{{ (global_stats.total_volume_inr / 1e7) | round(0) | int | string }} Cr
+                    {%- else -%}—{%- endif -%}
+                </span>
                 <span class="hstat-chg" id="heroVolumeChg"></span>
             </div>
             <div class="hstat">
                 <span class="hstat-label">BTC Dom.</span>
-                <span class="hstat-value" id="heroBtcDom">—</span>
+                <span class="hstat-value" id="heroBtcDom">
+                    {%- if global_stats and global_stats.btc_dominance -%}
+                        {{ global_stats.btc_dominance | round(1) }}%
+                    {%- else -%}—{%- endif -%}
+                </span>
                 <span class="hstat-chg up" id="heroBtcDomChg"></span>
             </div>
             <div class="hstat">
                 <span class="hstat-label">ETH Dom.</span>
-                <span class="hstat-value" id="heroEthDom">—</span>
+                <span class="hstat-value" id="heroEthDom">
+                    {%- if global_stats and global_stats.eth_dominance is defined -%}
+                        {{ global_stats.eth_dominance | round(1) }}%
+                    {%- else -%}—{%- endif -%}
+                </span>
                 <span class="hstat-chg" id="heroEthDomChg"></span>
             </div>
             <div class="hstat">
                 <span class="hstat-label">Active Coins</span>
-                <span class="hstat-value" id="heroCoins">—</span>
+                <span class="hstat-value" id="heroCoins">
+                    {%- if global_stats and global_stats.active_coins -%}
+                        {{ global_stats.active_coins | int }}
+                    {%- else -%}—{%- endif -%}
+                </span>
                 <span class="hstat-chg up" id="heroCoinsChg"></span>
             </div>
         </div>
