@@ -10,3 +10,5 @@ Flask-Talisman>=1.0.0
 flask-cors>=4.0.0
 flask-limiter>=2.0.0
 psycopg2-binary>=2.9,<3
+pycoingecko>=3.2.0
+firebase-admin>=6.0.0

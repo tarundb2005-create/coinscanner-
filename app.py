@@ -66,23 +66,36 @@ from flask_talisman import Talisman
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import generate_password_hash, check_password_hash
 from concurrent.futures import ThreadPoolExecutor
-from dotenv import load_dotenv
+from config import BASE_DIR, env_flag
 
 # Import our own modules
 import mock_data as data           # static exchange data (compare page)
-from database import init_db, get_db_connection, purge_old_logs
+from database import init_db, get_db_connection, release_db_connection, purge_old_logs, _init_db_pool, close_db_pool
+
+from utils.formatters import (
+    format_inr,
+    format_volume,
+    format_mcap,
+)
+from services.cache import (
+    PRICE_CACHE,
+    META_CACHE,
+    GLOBAL_CACHE,
+    NEWS_CACHE,
+    MARKET_CACHE,
+    _cache_lock,
+    redis_cache_get,
+    redis_cache_set,
+)
+
+# Shared CoinGecko API client (thread-safe, reuse across requests)
+from services.coingecko import coingecko
+
 
 # ── Load environment variables from .env file ──────────────
 # Variables like SECRET_KEY and NEWS_API_KEY live in .env
 # Never hardcode secrets in source code!
-load_dotenv()
 
-
-def _env_flag(name, default=False):
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _env_flag(name, default=False):
@@ -90,17 +103,20 @@ def _env_flag(name, default=False):
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 
 # ══════════════════════════════════════════════════════════
 # APP SETUP
 # ══════════════════════════════════════════════════════════
-BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+
 
 app = Flask(
     __name__,
     template_folder=os.path.join(BASE_DIR, "templates"),
     static_folder=os.path.join(BASE_DIR, "static"),
 )
+app.jinja_env.filters["format_inr"] = format_inr
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 application = app
 
@@ -124,12 +140,6 @@ app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 app.config['SESSION_COOKIE_SECURE']   = _env_flag('SESSION_COOKIE_SECURE', os.environ.get('FLASK_ENV') == 'production')
 app.config['PREFERRED_URL_SCHEME']    = 'https' if app.config['SESSION_COOKIE_SECURE'] else 'http'
-
-# ── Environment configuration ───────────────────────────
-app.config["SECRET_KEY"] = os.getenv("SECRET_KEY")
-app.config["SESSION_COOKIE_SECURE"] = app.config['SESSION_COOKIE_SECURE']
-app.config["SESSION_COOKIE_HTTPONLY"] = True
-app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
 # ── Redis + rate limiting ──────────────────────────────────
 REDIS_URL = os.getenv("REDIS_URL")
@@ -235,6 +245,9 @@ COINDCX_SECRET  = os.getenv("COINDCX_SECRET",  "")
 # News API key (newsdata.io) — optional, news page shows nothing without it
 NEWS_API_KEY   = os.getenv("NEWS_API_KEY")
 
+# Health check protection key
+HEALTH_CHECK_KEY = os.getenv("HEALTH_CHECK_KEY")
+
 # Email sender address — override this in Render if you need a test sender
 EMAIL_FROM_ADDRESS = os.getenv("EMAIL_FROM_ADDRESS", "onboarding@resend.dev")
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
@@ -274,25 +287,29 @@ TALISMAN_CSP = {
     "default-src": ["'self'"],
     "script-src": [
         "'self'",
-        "'unsafe-inline'",
         "https://www.gstatic.com",
         "https://cdnjs.cloudflare.com",
         "https://cdn.jsdelivr.net",
     ],
     "style-src": [
         "'self'",
-        "'unsafe-inline'",
         "https://fonts.googleapis.com",
         "https://cdnjs.cloudflare.com",
     ],
     "font-src": [
         "'self'",
         "https://fonts.gstatic.com",
+        "https://cdnjs.cloudflare.com",
         "data:",
     ],
     "img-src": [
         "'self'",
         "data:",
+        "https://assets.coingecko.com",
+        "https://coin-images.coingecko.com",
+        "https://assets.coincap.io",
+        "https://s2.coinmarketcap.com",
+        "https://www.gstatic.com",
     ],
     "connect-src": [
         "'self'",
@@ -301,6 +318,7 @@ TALISMAN_CSP = {
         "https://identitytoolkit.googleapis.com",
         "https://firebase.googleapis.com",
         "https://www.gstatic.com",
+        "https://api.coingecko.com",
     ],
     "frame-src": [
         "'self'",
@@ -332,9 +350,38 @@ Talisman(
 # ══════════════════════════════════════════════════════════
 # HEALTH CHECK ENDPOINTS
 # Production-grade readiness and dependency diagnostics.
-# ══════════════════════════════════════════════════
+
+
+def health_check_required(f):
+    """
+    Decorator that protects health check endpoints.
+    
+    Requires X-Health-Key header to match HEALTH_CHECK_KEY environment variable.
+    Returns 403 Forbidden if the key is missing or incorrect.
+    If HEALTH_CHECK_KEY is not set, health checks are publicly accessible.
+    """
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        # If no health check key is configured, allow public access
+        if not HEALTH_CHECK_KEY:
+            return f(*args, **kwargs)
+        
+        # Check for X-Health-Key header
+        provided_key = request.headers.get("X-Health-Key", "")
+        
+        if provided_key != HEALTH_CHECK_KEY:
+            app.logger.warning(
+                "Unauthorized health check attempt from %s",
+                request.remote_addr
+            )
+            return jsonify({"error": "Unauthorized"}), 403
+        
+        return f(*args, **kwargs)
+    return decorated
+
 
 @app.route("/health", methods=["GET"])
+@health_check_required
 def health():
     """
     Liveness probe.
@@ -345,6 +392,7 @@ def health():
 
 
 @app.route("/health/db", methods=["GET"])
+@health_check_required
 def health_db():
     """
     Database connectivity check.
@@ -364,6 +412,7 @@ def health_db():
 
 
 @app.route("/health/redis", methods=["GET"])
+@health_check_required
 def health_redis():
     """
     Redis connectivity check.
@@ -403,28 +452,65 @@ NEWS_CACHE   = {"data": [],           "timestamp": 0}  # newsdata.io articles
 MARKET_CACHE = {"data": ([], [], []), "timestamp": 0}  # gainers/losers/picks
 
 
+# ── Helper functions for Redis caching ──
 def _redis_cache_get(key):
-    if not redis_client:
-        return None
-    try:
-        raw = redis_client.get(key)
-        if not raw:
-            return None
-        return json.loads(raw)
-    except Exception as e:
-        app.logger.warning("Redis cache get failed for %s: %s", key, e)
-        return None
+    """
+    Get a value from Redis cache.
+    
+    Args:
+        key (str): Cache key
+    
+    Returns:
+        Cached value or None if not found
+    """
+    return redis_cache_get(redis_client, app, key)
 
 
 def _redis_cache_set(key, value, ttl):
-    if not redis_client:
-        return False
-    try:
-        redis_client.setex(key, ttl, json.dumps(value))
-        return True
-    except Exception as e:
-        app.logger.warning("Redis cache set failed for %s: %s", key, e)
-        return False
+    """
+    Set a value in Redis cache with TTL.
+    
+    Args:
+        key (str): Cache key
+        value: Value to cache (will be JSON serialized)
+        ttl (int): Time to live in seconds
+    
+    Returns:
+        True if set successfully, False otherwise
+    """
+    return redis_cache_set(redis_client, app, key, value, ttl)
+
+
+def get_cached_market(symbol):
+    """
+    Get cached market data for a specific coin symbol.
+    
+    Args:
+        symbol (str): Coin symbol
+    
+    Returns:
+        Cached market data or None if not found
+    """
+    key = f"market_cache:{symbol.upper()}"
+    return _redis_cache_get(key)
+
+
+def set_cached_market(symbol, data):
+    """
+    Set cached market data for a specific coin symbol.
+    
+    Args:
+        symbol (str): Coin symbol
+        data: Market data to cache
+    
+    Returns:
+        True if cached successfully, False otherwise
+    """
+    key = f"market_cache:{symbol.upper()}"
+    return _redis_cache_set(key, data, 10)  # 10 second TTL
+
+
+
 
 
 # ══════════════════════════════════════════════════════════
@@ -519,7 +605,7 @@ def get_dcx_prices():
     """
     # Return cached data if it's still fresh (under 60 seconds old)
     if redis_client is not None:
-        cached = _redis_cache_get("cache:prices")
+        cached = redis_cache_get(redis_client, app, "cache:prices")
         if cached and time.time() - cached.get("timestamp", 0) < 60:
             return cached.get("data", {})
     else:
@@ -528,7 +614,7 @@ def get_dcx_prices():
                 return PRICE_CACHE["data"]
 
     try:
-        res = requests.get("https://api.coindcx.com/exchange/ticker", timeout=10)
+        res = requests.get("https://api.coindcx.com/exchange/ticker", timeout=3)
         res.raise_for_status()
         tickers = res.json()
     except Exception as e:
@@ -575,20 +661,22 @@ def get_coin_metadata():
     """
     if redis_client is not None:
         cached = _redis_cache_get("cache:metadata")
-        if cached and time.time() - cached.get("timestamp", 0) < 300:
+        if cached and time.time() - cached.get("timestamp", 0) < 86400:
             return cached.get("data", {})
     else:
         with _cache_lock:
-            if time.time() - META_CACHE["timestamp"] < 300:
+            if time.time() - META_CACHE["timestamp"] < 86400:
                 return META_CACHE["data"]
 
+    # ── Step 0: Fetch dynamic logos from CoinGecko markets ──
+    coingecko.load_logos()
     # ── Step 1: Fetch markets_details for real coin names ──
     name_map  = {}   # symbol → full name  e.g. "BTC" → "Bitcoin"
     pair_map  = {}   # symbol → candle pair e.g. "BTC" → "I-BTC_INR"
     try:
         r = requests.get(
             "https://api.coindcx.com/exchange/v1/markets_details",
-            timeout=15
+            timeout=5
         )
         r.raise_for_status()
         for m in r.json():
@@ -609,7 +697,7 @@ def get_coin_metadata():
     try:
         r2 = requests.get(
             "https://api.coindcx.com/exchange/ticker",
-            timeout=10
+            timeout=5
         )
         r2.raise_for_status()
         tickers = r2.json()
@@ -647,7 +735,8 @@ def get_coin_metadata():
 
     for t in inr_tickers:
         market = t.get("market", "")              # e.g. "BTCINR"
-        symbol = market[:-3].upper() if market.endswith("INR") else ""
+        symbol = market[:-3].upper()
+        
         if not symbol or symbol in seen:
             continue
         seen.add(symbol)
@@ -664,85 +753,31 @@ def get_coin_metadata():
         low    = float(t.get("low",            0) or 0)
         volume = float(t.get("volume",         0) or 0)
 
-        LOGO_MAP = {
-            "BTC":"https://assets.coingecko.com/coins/images/1/small/bitcoin.png",
-            "ETH":"https://assets.coingecko.com/coins/images/279/small/ethereum.png",
-            "USDT":"https://assets.coingecko.com/coins/images/325/small/Tether.png",
-            "BNB":"https://assets.coingecko.com/coins/images/825/small/bnb-icon2_2x.png",
-            "SOL":"https://assets.coingecko.com/coins/images/4128/small/solana.png",
-            "XRP":"https://assets.coingecko.com/coins/images/44/small/xrp-symbol-white-128.png",
-            "USDC":"https://assets.coingecko.com/coins/images/6319/small/usdc.png",
-            "ADA":"https://assets.coingecko.com/coins/images/975/small/cardano.png",
-            "AVAX":"https://assets.coingecko.com/coins/images/12559/small/Avalanche_Circle_RedWhite_Trans.png",
-            "DOGE":"https://assets.coingecko.com/coins/images/5/small/dogecoin.png",
-            "TRX":"https://assets.coingecko.com/coins/images/1094/small/tron-logo.png",
-            "DOT":"https://assets.coingecko.com/coins/images/12171/small/polkadot.png",
-            "LINK":"https://assets.coingecko.com/coins/images/877/small/chainlink-new-logo.png",
-            "MATIC":"https://assets.coingecko.com/coins/images/4713/small/matic-token-icon.png",
-            "LTC":"https://assets.coingecko.com/coins/images/2/small/litecoin.png",
-            "SHIB":"https://assets.coingecko.com/coins/images/11939/small/shiba.png",
-            "UNI":"https://assets.coingecko.com/coins/images/12504/small/uniswap-uni.png",
-            "ATOM":"https://assets.coingecko.com/coins/images/1481/small/cosmos_hub.png",
-            "XLM":"https://assets.coingecko.com/coins/images/100/small/Stellar_symbol_black_RGB.png",
-            "ETC":"https://assets.coingecko.com/coins/images/453/small/ethereum-classic-logo.png",
-            "BCH":"https://assets.coingecko.com/coins/images/780/small/bitcoin-cash-circle.png",
-            "APT":"https://assets.coingecko.com/coins/images/26455/small/aptos_round.png",
-            "FIL":"https://assets.coingecko.com/coins/images/12817/small/filecoin.png",
-            "NEAR":"https://assets.coingecko.com/coins/images/10365/small/near.jpg",
-            "ARB":"https://assets.coingecko.com/coins/images/16547/small/photo_2023-03-29_21.47.00.jpeg",
-            "OP":"https://assets.coingecko.com/coins/images/25244/small/Optimism.png",
-            "INJ":"https://assets.coingecko.com/coins/images/12882/small/Secondary_Symbol.png",
-            "MKR":"https://assets.coingecko.com/coins/images/1364/small/Mark_Maker.png",
-            "AAVE":"https://assets.coingecko.com/coins/images/12645/small/AAVE.png",
-            "SUI":"https://assets.coingecko.com/coins/images/26375/small/sui_asset.jpeg",
-            "PEPE":"https://assets.coingecko.com/coins/images/29850/small/pepe-token.jpeg",
-            "WIF":"https://assets.coingecko.com/coins/images/33566/small/dogwifhat.jpg",
-            "BONK":"https://assets.coingecko.com/coins/images/28600/small/bonk.jpg",
-            "TON":"https://assets.coingecko.com/coins/images/17980/small/ton_symbol.png",
-            "XMR":"https://assets.coingecko.com/coins/images/69/small/monero_logo.png",
-            "ZEC":"https://assets.coingecko.com/coins/images/486/small/circle-zcash-color.png",
-            "ALGO":"https://assets.coingecko.com/coins/images/4380/small/download.png",
-            "VET":"https://assets.coingecko.com/coins/images/1167/small/VET_Token_Icon.png",
-            "FTM":"https://assets.coingecko.com/coins/images/4001/small/Fantom_round.png",
-            "SAND":"https://assets.coingecko.com/coins/images/12129/small/sandbox_logo.jpg",
-            "MANA":"https://assets.coingecko.com/coins/images/878/small/decentraland-mana.png",
-            "CRV":"https://assets.coingecko.com/coins/images/12124/small/Curve.png",
-            "GRT":"https://assets.coingecko.com/coins/images/13397/small/Graph_Token.png",
-            "SNX":"https://assets.coingecko.com/coins/images/3406/small/SNX.png",
-            "RNDR":"https://assets.coingecko.com/coins/images/11636/small/rndr.png",
-            "FET":"https://assets.coingecko.com/coins/images/5681/small/Fetch.jpg",
-            "RUNE":"https://assets.coingecko.com/coins/images/6595/small/Rune200x200.png",
-            "KSM":"https://assets.coingecko.com/coins/images/9568/small/m4zRhP5e_400x400.jpg",
-            "CHZ":"https://assets.coingecko.com/coins/images/8834/small/Chiliz.png",
-            "BAT":"https://assets.coingecko.com/coins/images/677/small/basic-attention-token.png",
-            "FLOKI":"https://assets.coingecko.com/coins/images/16746/small/FLOKI.png",
-            "GALA":"https://assets.coingecko.com/coins/images/12493/small/GALA-COINGECKO.png",
-            "BLUR":"https://assets.coingecko.com/coins/images/28453/small/blur.png",
-        }
-        # CryptoCompare CDN is reliable and doesn't rate-limit image requests
-        image = LOGO_MAP.get(symbol, f"https://www.cryptocompare.com/media/37746251/{symbol.lower()}.png")
+        # Fetch logo for this coin with comprehensive logging
+        image = coingecko.get_logo(symbol)
+        
+        # Log which coins are getting default fallback image
+        if image == "/static/images/default-coin.png":
+            app.logger.debug(f"[METADATA] {symbol}: no logo found, using default")
 
         meta_map[symbol] = {
-            "id":                 symbol,
-            "name":               name,
-            "symbol":             symbol,
-            "image":              image,
-            "market_cap":         0,
-            "market_cap_rank":    0,
-            "ath":                0, "atl": 0,
-            "circulating_supply": 0,
-            "total_supply":       0,
-            "sparkline":          [],
-            "cg_price":           price,
-            "cg_change_24h":      change,
-            "cg_volume":          volume,
-            "cg_high":            high,
-            "cg_low":             low,
-            "pair":               candle_pair,   # e.g. "I-BTC_INR" — correct format for candles
+            "name": name,
+            "image": image,
+            "price": price,
+            "change": change,
+            "high": high,
+            "low": low,
+            "volume": volume,
+            "pair": candle_pair,
         }
 
+    # Log summary of logo loading
+    coins_with_logos = sum(1 for m in meta_map.values() if m["image"] != "/static/images/default-coin.png")
+    coins_without_logos = len(meta_map) - coins_with_logos
+    app.logger.info(f"[METADATA] Coins with logos: {coins_with_logos}/{len(meta_map)}, Fallback: {coins_without_logos}")
+
     if redis_client is not None:
-        _redis_cache_set("cache:metadata", {"data": meta_map, "timestamp": time.time()}, 300)
+        _redis_cache_set("cache:metadata", {"data": meta_map, "timestamp": time.time()}, 86400)
     else:
         with _cache_lock:
             META_CACHE["data"]      = meta_map
@@ -773,9 +808,7 @@ def get_global_stats():
                 return GLOBAL_CACHE["data"]
 
     try:
-        res = requests.get("https://api.coingecko.com/api/v3/global", timeout=10)
-        res.raise_for_status()
-        raw = res.json().get("data", {})
+        raw = coingecko.get_global()
     except Exception as e:
         app.logger.warning("CoinGecko global error: %s", e)
         return GLOBAL_CACHE["data"]
@@ -808,35 +841,55 @@ def get_global_stats():
 
 def build_coin(symbol, meta, prices):
     """
-    Build a unified coin dict from CoinDCX metadata + live ticker price.
-
-    Since metadata is now sourced from CoinDCX markets_details + ticker,
-    both meta and prices are keyed by symbol (e.g. "BTC").
-
+    Build a complete coin object for rendering/API response.
+    
+    Normalizes all fields including image URLs with fallback support.
+    Ensures consistent field naming across all coin objects.
+    
     Args:
-        symbol (str):  CoinDCX symbol, e.g. "BTC"
-        meta   (dict): metadata entry from get_coin_metadata()
-        prices (dict): price map from get_dcx_prices()
-
+        symbol (str): Coin symbol (BTC, ETH, etc.)
+        meta (dict): Coin metadata from get_coin_metadata()
+        prices (dict): Live price data from get_dcx_prices()
+        
     Returns:
-        dict — all fields a template needs to display a coin row/card
+        dict: Complete coin object with all fields normalized
     """
-    dcx    = prices.get(symbol, {})
+    dcx = prices.get(symbol, {})
 
-    # Use live ticker price if available, else fall back to meta snapshot
-    price  = dcx.get("last_price")  or meta.get("cg_price", 0)
-    change = dcx.get("change_24h")  if dcx else meta.get("cg_change_24h", 0)
-    volume = dcx.get("volume")      or meta.get("cg_volume", 0)
-    high   = dcx.get("high")        or meta.get("cg_high", 0)
-    low    = dcx.get("low")         or meta.get("cg_low", 0)
+    price  = dcx.get("last_price") or meta.get("cg_price", 0)
+    change = dcx.get("change_24h") if dcx else meta.get("cg_change_24h", 0)
+    volume = dcx.get("volume") or meta.get("cg_volume", 0)
+    high   = dcx.get("high") or meta.get("cg_high", 0)
+    low    = dcx.get("low") or meta.get("cg_low", 0)
     change = float(change or 0)
     mcap   = meta.get("market_cap", 0)
+
+    # ── NORMALIZE IMAGE FIELD ─────────────────────────────
+    # Coin images can come from multiple sources and field names.
+    # Normalize to single "image" field with comprehensive fallback chain:
+    #   1. meta["image"] (CoinGecko logo from CoinGeckoService)
+    #   2. meta.get("logo"), meta.get("logo_url") (alternative names)
+    #   3. meta.get("thumb") (CoinGecko thumbnail)
+    #   4. Fallback to default image
+    # ───────────────────────────────────────────────────────
+    image = (
+        meta.get("image") 
+        or meta.get("logo") 
+        or meta.get("icon") 
+        or meta.get("logo_url")
+        or meta.get("thumb")
+        or "/static/images/default-coin.png"
+    )
+    
+    # Log if using fallback (debug only)
+    if image == "/static/images/default-coin.png":
+        app.logger.debug(f"[BUILD_COIN] {symbol} using fallback image (no logo from API)")
 
     return {
         "id":                          symbol,
         "name":                        meta["name"],
         "symbol":                      symbol,
-        "image":                       meta["image"],
+        "image":                       image,
         "current_price":               float(price or 0),
         "formatted_price":             format_inr(price),
         "price_change_percentage_24h": change,
@@ -1131,6 +1184,41 @@ def login_required(f):
 
 
 # ══════════════════════════════════════════════════════════
+# APP INITIALIZATION & LIFECYCLE
+# ══════════════════════════════════════════════════════════
+
+_initialized = False
+
+@app.before_request
+def before_request():
+    """
+    Initialize database and connection pool on first request.
+    This runs once when the app handles its first HTTP request.
+    """
+    global _initialized
+    if not _initialized:
+        try:
+            _init_db_pool()  # Initialize PostgreSQL connection pool
+            init_db()        # Create tables and run migrations
+            _initialized = True
+            app.logger.info("Database pool and tables initialized")
+        except Exception as e:
+            app.logger.error("Failed to initialize database: %s", e)
+            _initialized = True  # Don't retry
+
+
+@app.teardown_appcontext
+def teardown_db(exception=None):
+    """
+    Close database connections and clean up the pool.
+    This runs when the app context is torn down.
+    """
+    if exception:
+        app.logger.error("App context teardown with exception: %s", exception)
+    close_db_pool()
+
+
+# ══════════════════════════════════════════════════════════
 # ERROR HANDLERS
 # These run when Flask encounters an error.
 # Returns a proper HTML page instead of a raw error string.
@@ -1167,14 +1255,24 @@ def home():
 
     Template: templates/public/home.html
     """
-    news                   = get_crypto_news()[:6]
-    gainers, losers, picks = get_market_movers()
-    global_stats           = get_global_stats()
-    prices                 = get_dcx_prices()
-    meta                   = get_coin_metadata()
-    all_coins              = [build_coin(sym, m, prices) for sym, m in meta.items()]
-    # Sort by volume descending (proxy for importance since CoinDCX has no market cap rank)
-    top_coins              = sorted(all_coins, key=lambda x: x["total_volume"], reverse=True)[:25]
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        news_future = executor.submit(get_crypto_news)
+        movers_future = executor.submit(get_market_movers)
+        stats_future = executor.submit(get_global_stats)
+        prices_future = executor.submit(get_dcx_prices)
+        meta_future = executor.submit(get_coin_metadata)
+
+        news = news_future.result()[:6]
+        gainers, losers, picks = movers_future.result()
+        global_stats = stats_future.result()
+        prices = prices_future.result()
+        meta = meta_future.result()
+
+        all_coins = [build_coin(sym, m, prices) for sym, m in meta.items()]
+        top_coins = sorted(
+            all_coins,
+            key=lambda x: x["total_volume"],
+            reverse=True)[:25]
 
     return render_template(
         "public/home.html",
@@ -1300,6 +1398,63 @@ def debug_dcx():
     return jsonify(results)
 
 
+@app.route("/api/debug/coins")
+def debug_coins():
+    """
+    Debug endpoint — inspect coin logo loading and data integrity.
+    
+    Shows:
+    - Total coins loaded
+    - Sample coins with their logos
+    - Coins using fallback images
+    - CoinGecko cache status
+    
+    Remove this before going to production.
+    """
+    meta = get_coin_metadata()
+    
+    if not meta:
+        return jsonify({"error": "No metadata loaded"}), 500
+    
+    # Analyze logo distribution
+    coins_with_real_logos = []
+    coins_with_fallback = []
+    
+    for symbol, data in meta.items():
+        image = data.get("image", "")
+        if image == "/static/images/default-coin.png":
+            coins_with_fallback.append({
+                "symbol": symbol,
+                "name": data.get("name"),
+                "image": image
+            })
+        else:
+            coins_with_real_logos.append({
+                "symbol": symbol,
+                "name": data.get("name"),
+                "image": image[:80] + "..." if len(image) > 80 else image
+            })
+    
+    # Show sample of real logos
+    sample_real = coins_with_real_logos[:5] if coins_with_real_logos else []
+    sample_fallback = coins_with_fallback[:5] if coins_with_fallback else []
+    
+    return jsonify({
+        "total_coins": len(meta),
+        "coins_with_logos": len(coins_with_real_logos),
+        "coins_with_fallback": len(coins_with_fallback),
+        "logo_percentage": round(100 * len(coins_with_real_logos) / len(meta), 1) if meta else 0,
+        "sample_real_logos": sample_real,
+        "sample_fallback_coins": sample_fallback,
+        "coingecko_cache_size": len(coingecko.logo_cache),
+        "major_coins_logos": {
+            "BTC": coingecko.get_logo("BTC")[:60] + "...",
+            "ETH": coingecko.get_logo("ETH")[:60] + "...",
+            "SOL": coingecko.get_logo("SOL")[:60] + "...",
+        }
+    })
+
+
 @app.route("/api/market-stats")
 def api_market_stats():
     """
@@ -1344,12 +1499,7 @@ def api_trending():
             return jsonify({"ok": True, "coins": _trending_cache["data"]})
 
     try:
-        res = requests.get(
-            "https://api.coingecko.com/api/v3/search/trending",
-            timeout=10,
-        )
-        res.raise_for_status()
-        raw    = res.json()
+        raw = coingecko.get_trending()
         coins  = [
             {
                 "id":     item["item"].get("id", ""),
@@ -1478,6 +1628,9 @@ def api_coin_chart(symbol):
     except (ValueError, TypeError):
         days = 7
 
+    prices = []
+
+    # 1. Try fetching from CoinDCX
     try:
         res = requests.get(
             "https://public.coindcx.com/market_data/candles/",
@@ -1488,30 +1641,44 @@ def api_coin_chart(symbol):
             },
             timeout=10,
         )
-        res.raise_for_status()
-        candles = res.json()
-        # CoinDCX candle format: [time, open, high, low, close, volume]
-        prices = [
-            [int(c[0]) * 1000, float(c[4])]
-            for c in candles if len(c) >= 5
-        ]
-
-        # Convert to USD if requested
-        if currency == "usd" and prices:
-            try:
-                fx  = requests.get(
-                    "https://api.exchangerate-api.com/v4/latest/USD", timeout=5
-                ).json()
-                inr_per_usd = fx.get("rates", {}).get("INR", 84.5)
-                prices = [[t, p / inr_per_usd] for t, p in prices]
-            except Exception:
-                pass   # return INR prices as fallback
-
-        return jsonify({"prices": prices})
-
+        if res.status_code == 200:
+            candles = res.json()
+            for c in candles:
+                if isinstance(c, dict):
+                    ts = c.get("time")
+                    close = c.get("close")
+                    if ts is not None and close is not None:
+                        prices.append([int(ts), float(close)])
+                elif isinstance(c, (list, tuple)) and len(c) >= 5:
+                    ts = int(c[0])
+                    if ts < 10000000000:
+                        ts *= 1000
+                    prices.append([ts, float(c[4])])
     except Exception as e:
-        app.logger.warning("Chart API error for %s: %s", symbol, e)
-        return jsonify({"prices": []}), 200   # empty but valid — JS handles it gracefully
+        app.logger.warning("CoinDCX candles API error for %s: %s", symbol, e)
+
+    # Convert CoinDCX INR prices to USD if requested
+    if currency == "usd" and prices:
+        try:
+            fx  = requests.get(
+                "https://api.exchangerate-api.com/v4/latest/USD", timeout=5
+            ).json()
+            inr_per_usd = fx.get("rates", {}).get("INR", 84.5)
+            prices = [[t, p / inr_per_usd] for t, p in prices]
+        except Exception:
+            pass
+
+    # 2. Fallback to CoinGecko chart API if CoinDCX returned no data
+    if not prices:
+        try:
+            coingecko_id = coingecko.search_coin(symbol)
+            if coingecko_id:
+                chart_res = coingecko.get_coin_chart(coingecko_id, vs_currency=currency, days=days)
+                prices = chart_res.get("prices", [])
+        except Exception as e:
+            app.logger.warning("CoinGecko fallback candles API error for %s: %s", symbol, e)
+
+    return jsonify({"prices": prices})
 
 
 @app.route("/coin/<coin_id>")
@@ -1520,10 +1687,11 @@ def coin_page(coin_id):
     Individual coin detail page (e.g. /coin/BTC).
 
     Fetches price + candle data from CoinDCX.
-    Global stats and trending still use CoinGecko (1 call/5min, not rate-limited).
+    Falls back to CoinGecko for rich metadata (descriptions, links, dev stats)
+    and handles coins that only exist on CoinGecko (like VELVET) dynamically.
 
     Args:
-        coin_id (str): CoinDCX symbol from the URL, e.g. "BTC"
+        coin_id (str): Coin symbol or ID from the URL, e.g. "BTC" or "VELVET"
 
     Template: templates/public/coin.html
     """
@@ -1540,67 +1708,173 @@ def coin_page(coin_id):
     meta    = get_coin_metadata()
     prices  = get_dcx_prices()
 
-    # coin_id in URL is the DCX symbol (e.g. "BTC") — uppercase it
+    # coin_id in URL is the symbol (e.g. "BTC") — uppercase it
     symbol  = coin_id.upper()
     m       = meta.get(symbol)
 
-    if not m:
+    # Look up on CoinGecko for description, links, and details fallback
+    coingecko_id = coingecko.search_coin(symbol)
+    cg_data = coingecko.get_coin_details(coingecko_id) if coingecko_id else {}
+
+    # If the coin doesn't exist in CoinDCX metadata AND didn't return any CoinGecko details, abort
+    if not m and not cg_data:
         abort(404)
 
-    dcx   = prices.get(symbol, {})
-    price = dcx.get("last_price") or m.get("cg_price", 0)
-    change= dcx.get("change_24h") if dcx else m.get("cg_change_24h", 0)
-    high  = dcx.get("high")       or m.get("cg_high", 0)
-    low   = dcx.get("low")        or m.get("cg_low", 0)
-    volume= dcx.get("volume")     or m.get("cg_volume", 0)
+    # Resolve coin identity details
+    if m:
+        name = m.get("name", symbol)
+        image_url = m.get("image", "/static/images/default-coin.png")
+        price_source = "coindcx"
+        
+        # Get live CoinDCX pricing
+        dcx = prices.get(symbol, {})
+        price_inr = dcx.get("last_price") or m.get("cg_price", 0)
+        change = dcx.get("change_24h") if dcx else m.get("cg_change_24h", 0)
+        high_inr = dcx.get("high") or m.get("cg_high", 0)
+        low_inr = dcx.get("low") or m.get("cg_low", 0)
+        volume_inr = dcx.get("volume") or m.get("cg_volume", 0)
+        
+        # Default USD fallbacks
+        usd_rate = 84.5
+        price_usd = price_inr / usd_rate if price_inr else 0
+        high_usd = high_inr / usd_rate if high_inr else 0
+        low_usd = low_inr / usd_rate if low_inr else 0
+        volume_usd = volume_inr / usd_rate if volume_inr else 0
+        mcap_inr = 0
+        mcap_usd = 0
+        
+        # Override/enrich with CoinGecko stats if available
+        if cg_data:
+            cg_md = cg_data.get("market_data", {})
+            price_usd = cg_md.get("current_price", {}).get("usd") or price_usd
+            price_inr = price_inr or cg_md.get("current_price", {}).get("inr", 0)
+            high_usd = cg_md.get("high_24h", {}).get("usd") or high_usd
+            high_inr = high_inr or cg_md.get("high_24h", {}).get("inr", 0)
+            low_usd = cg_md.get("low_24h", {}).get("usd") or low_usd
+            low_inr = low_inr or cg_md.get("low_24h", {}).get("inr", 0)
+            volume_usd = cg_md.get("total_volume", {}).get("usd") or volume_usd
+            volume_inr = volume_inr or cg_md.get("total_volume", {}).get("inr", 0)
+            mcap_inr = cg_md.get("market_cap", {}).get("inr", 0)
+            mcap_usd = cg_md.get("market_cap", {}).get("usd", 0)
+    else:
+        # Fallback CoinGecko-only coin (like VELVET)
+        name = cg_data.get("name", symbol)
+        image_url = cg_data.get("image", {}).get("large", "/static/images/default-coin.png")
+        price_source = "coingecko"
+        
+        cg_md = cg_data.get("market_data", {})
+        price_inr = cg_md.get("current_price", {}).get("inr", 0)
+        price_usd = cg_md.get("current_price", {}).get("usd", 0)
+        change = cg_md.get("price_change_percentage_24h", 0)
+        high_inr = cg_md.get("high_24h", {}).get("inr", 0)
+        high_usd = cg_md.get("high_24h", {}).get("usd", 0)
+        low_inr = cg_md.get("low_24h", {}).get("inr", 0)
+        low_usd = cg_md.get("low_24h", {}).get("usd", 0)
+        volume_inr = cg_md.get("total_volume", {}).get("inr", 0)
+        volume_usd = cg_md.get("total_volume", {}).get("usd", 0)
+        mcap_inr = cg_md.get("market_cap", {}).get("inr", 0)
+        mcap_usd = cg_md.get("market_cap", {}).get("usd", 0)
+
+    # Get optional stats and descriptions from CoinGecko data
+    market_data = cg_data.get("market_data", {}) if cg_data else {}
+    ath_inr = market_data.get("ath", {}).get("inr", 0) if market_data else 0
+    ath_usd = market_data.get("ath", {}).get("usd", 0) if market_data else 0
+    atl_inr = market_data.get("atl", {}).get("inr", 0) if market_data else 0
+    atl_usd = market_data.get("atl", {}).get("usd", 0) if market_data else 0
+    fdv_inr = market_data.get("fully_diluted_valuation", {}).get("inr", 0) if market_data else 0
+    fdv_usd = market_data.get("fully_diluted_valuation", {}).get("usd", 0) if market_data else 0
+    
+    circulating_supply = market_data.get("circulating_supply", 0) if market_data else 0
+    total_supply = market_data.get("total_supply", 0) if market_data else 0
+    max_supply = market_data.get("max_supply", 0) if market_data else 0
+    
+    description_en = cg_data.get("description", {}).get("en", "") if cg_data else ""
+    categories = cg_data.get("categories", []) if cg_data else []
+    market_cap_rank = cg_data.get("market_cap_rank") if cg_data else None
+
+    # Links
+    links_src = cg_data.get("links", {}) if cg_data else {}
+    homepage_list = [h for h in links_src.get("homepage", []) if h]
+    blockchain_list = [b for b in links_src.get("blockchain_site", []) if b]
+    subreddit = links_src.get("subreddit_url")
+    github_list = [g for g in links_src.get("repos_url", {}).get("github", []) if g]
+    twitter = links_src.get("twitter_screen_name")
+
+    # Developer data
+    dev_src = cg_data.get("developer_data", {}) if cg_data else {}
+    developer_data = {
+        "stars": dev_src.get("stars", 0),
+        "forks": dev_src.get("forks", 0),
+        "pull_requests_merged": dev_src.get("pull_requests_merged", 0),
+        "commit_count_4_weeks": dev_src.get("commit_count_4_weeks", 0),
+    } if dev_src else {}
 
     # Fetch 7-day candles from CoinDCX for the chart
-    pair       = m.get("pair", f"{symbol}INR")
     chart_prices = []
-    try:
-        candle_url = "https://public.coindcx.com/market_data/candles/"
-        candle_res = requests.get(candle_url, params={
-            "pair":     f"I-{symbol}_INR",
-            "interval": "1d",
-            "limit":    7,
-        }, timeout=10)
-        if candle_res.status_code == 200:
-            candles = candle_res.json()
-            # CoinDCX candle format: [time, open, high, low, close, volume]
-            chart_prices = [
-                [int(c[0]) * 1000, float(c[4])]   # [timestamp_ms, close_price]
-                for c in candles if len(c) >= 5
-            ]
-    except Exception as e:
-        app.logger.warning("CoinDCX candles error for %s: %s", symbol, e)
+    if m:
+        try:
+            candle_url = "https://public.coindcx.com/market_data/candles/"
+            candle_res = requests.get(candle_url, params={
+                "pair":     f"I-{symbol}_INR",
+                "interval": "1d",
+                "limit":    7,
+            }, timeout=10)
+            if candle_res.status_code == 200:
+                candles = candle_res.json()
+                for c in candles:
+                    if isinstance(c, dict):
+                        ts = c.get("time")
+                        close = c.get("close")
+                        if ts is not None and close is not None:
+                            chart_prices.append([int(ts), float(close)])
+                    elif isinstance(c, (list, tuple)) and len(c) >= 5:
+                        ts = int(c[0])
+                        if ts < 10000000000:
+                            ts *= 1000
+                        chart_prices.append([ts, float(c[4])])
+        except Exception as e:
+            app.logger.warning("CoinDCX candles error for %s: %s", symbol, e)
+
+    # Fallback: if chart_prices is empty, get chart from CoinGecko
+    if not chart_prices and coingecko_id:
+        try:
+            chart_res = coingecko.get_coin_chart(coingecko_id, vs_currency="inr", days=7)
+            chart_prices = chart_res.get("prices", [])
+        except Exception as e:
+            app.logger.warning("CoinGecko fallback chart error for %s: %s", symbol, e)
 
     # Build coin_data dict that coin.html template expects
     coin_data = {
         "id":           symbol,
-        "name":         m["name"],
+        "name":         name,
         "symbol":       symbol,
-        "image":        {"large": m["image"]},
-        "price_source": "coindcx",
+        "image":        {"large": image_url},
+        "price_source": price_source,
+        "market_cap_rank": market_cap_rank,
+        "categories":   categories,
         "market_data": {
-            "current_price":                {"inr": price, "usd": 0},
+            "current_price":                {"inr": price_inr, "usd": price_usd},
             "price_change_percentage_24h":  float(change or 0),
-            "high_24h":                     {"inr": high},
-            "low_24h":                      {"inr": low},
-            "total_volume":                 {"inr": volume},
-            "market_cap":                   {"inr": 0},
-            "circulating_supply":           0,
-            "total_supply":                 0,
-            "ath":                          {"inr": 0},
-            "atl":                          {"inr": 0},
+            "high_24h":                     {"inr": high_inr, "usd": high_usd},
+            "low_24h":                      {"inr": low_inr, "usd": low_usd},
+            "total_volume":                 {"inr": volume_inr, "usd": volume_usd},
+            "market_cap":                   {"inr": mcap_inr, "usd": mcap_usd},
+            "circulating_supply":           circulating_supply,
+            "total_supply":                 total_supply,
+            "max_supply":                   max_supply,
+            "ath":                          {"inr": ath_inr, "usd": ath_usd},
+            "atl":                          {"inr": atl_inr, "usd": atl_usd},
+            "fully_diluted_valuation":      {"inr": fdv_inr, "usd": fdv_usd},
         },
-        "description":  {"en": ""},
+        "description":  {"en": description_en},
         "links": {
-            "homepage":           [],
-            "whitepaper":         "",
-            "subreddit_url":      "",
-            "repos_url":          {"github": []},
+            "homepage":           homepage_list,
+            "blockchain_site":    blockchain_list,
+            "subreddit_url":      subreddit,
+            "repos_url":          {"github": github_list},
+            "twitter_screen_name": twitter,
         },
-        "developer_data": {},
+        "developer_data": developer_data,
         "community_data": {},
     }
 
@@ -1894,6 +2168,22 @@ _otp_cache = {}
 _otp_cache_lock = threading.Lock()
 
 
+def _get_otp_attempt_count(category, identifier):
+    """
+    Get the current brute-force attempt count for an OTP verification.
+    Returns the count (0 if not set).
+    """
+    attempts_key = f"otp_attempts:{category}:{identifier.strip().lower()}"
+    
+    if redis_client:
+        attempts = redis_client.get(attempts_key)
+        return int(attempts) if attempts else 0
+    else:
+        if not hasattr(_verify_otp, "_attempts_cache"):
+            _verify_otp._attempts_cache = {}
+        return _verify_otp._attempts_cache.get(attempts_key, 0)
+
+
 def _generate_otp():
     return "".join(str(secrets.randbelow(10)) for _ in range(6))
 
@@ -1916,6 +2206,28 @@ def _verify_otp(category, identifier, entered):
     if not entered:
         return False
 
+    # ──────────────────────────────────────────────────────────
+    # Brute-force protection: max 5 attempts per identifier
+    # ──────────────────────────────────────────────────────────
+    attempts_key = f"otp_attempts:{category}:{identifier.strip().lower()}"
+    
+    if redis_client:
+        attempts = redis_client.get(attempts_key)
+        attempts = int(attempts) if attempts else 0
+        
+        if attempts >= 5:
+            return False  # Too many attempts
+    else:
+        # Fallback: use in-memory tracking
+        if not hasattr(_verify_otp, "_attempts_cache"):
+            _verify_otp._attempts_cache = {}
+        attempts = _verify_otp._attempts_cache.get(attempts_key, 0)
+        if attempts >= 5:
+            return False
+    
+    # ──────────────────────────────────────────────────────────
+    # Try to verify the OTP
+    # ──────────────────────────────────────────────────────────
     key = _build_otp_key(category, identifier)
     stored = None
     if redis_client:
@@ -1927,16 +2239,36 @@ def _verify_otp(category, identifier, entered):
             stored = entry["hash"]
 
     if not stored:
+        # OTP not found or expired — increment attempts
+        if redis_client:
+            redis_client.incr(attempts_key)
+            redis_client.expire(attempts_key, 300)  # 5 minutes expiry
+        else:
+            _verify_otp._attempts_cache[attempts_key] = attempts + 1
         return False
+    
     if isinstance(stored, bytes):
         stored = stored.decode("utf-8")
+    
     valid = check_password_hash(stored, entered)
+    
     if valid:
+        # ✅ OTP verified — reset attempts and delete OTP
         if redis_client:
             redis_client.delete(key)
+            redis_client.delete(attempts_key)
         else:
             with _otp_cache_lock:
                 _otp_cache.pop(key, None)
+            _verify_otp._attempts_cache.pop(attempts_key, None)
+    else:
+        # ❌ Wrong OTP — increment attempts
+        if redis_client:
+            redis_client.incr(attempts_key)
+            redis_client.expire(attempts_key, 300)  # 5 minutes expiry
+        else:
+            _verify_otp._attempts_cache[attempts_key] = attempts + 1
+    
     return valid
 
 
@@ -1971,6 +2303,7 @@ def log_login_attempt(ip, identifier, success, reason):
 # ══════════════════════════════════════════════════════════
 
 @app.route("/login", methods=["GET", "POST"])
+@limiter.limit("10 per minute")
 def login():
     """
     Login page.
@@ -2099,7 +2432,7 @@ def login():
 
 
 @app.route("/signup", methods=["GET", "POST"])
-@limiter.limit("5 per minute")
+@limiter.limit("10 per minute")
 def signup():
     """
     Signup — collects name, email, phone, password.
@@ -2190,7 +2523,7 @@ def signup():
 
 
 @app.route("/verify-email", methods=["GET", "POST"])
-@limiter.limit("5 per minute")
+@limiter.limit("15 per minute")
 def verify_email():
     """
     Step 1 of 2 — verify email OTP sent at signup.
@@ -2233,25 +2566,29 @@ def verify_email():
         if not entered:
             error = "Please enter the OTP."
         else:
-            firebase_token = request.form.get("firebase_token", "").strip()
-            valid = False
-            if firebase_token:
-                verified_email = _firebase_verify_email_token(firebase_token)
-                valid = bool(verified_email and verified_email.lower() == email.lower())
+            attempts = _get_otp_attempt_count("email", email)
+            if attempts >= 5:
+                error = "Too many verification attempts. Please try again later or request a new code."
             else:
-                valid = _verify_otp("email", email, entered)
+                firebase_token = request.form.get("firebase_token", "").strip()
+                valid = False
+                if firebase_token:
+                    verified_email = _firebase_verify_email_token(firebase_token)
+                    valid = bool(verified_email and verified_email.lower() == email.lower())
+                else:
+                    valid = _verify_otp("email", email, entered)
 
-            if not valid:
-                error = "Email verification failed. Please try again."
-            else:
-                cursor.execute(
-                    "UPDATE users SET email_verified = TRUE, status = CASE WHEN phone_verified IS TRUE THEN 'active' ELSE 'pending' END "
-                    "WHERE email = %s",
-                    (email,)
-                )
-                conn.commit()
-                conn.close()
-                return redirect(url_for("verify_phone", email=email))
+                if not valid:
+                    error = "Email verification failed. Please try again."
+                else:
+                    cursor.execute(
+                        "UPDATE users SET email_verified = TRUE, status = CASE WHEN phone_verified IS TRUE THEN 'active' ELSE 'pending' END "
+                        "WHERE email = %s",
+                        (email,)
+                    )
+                    conn.commit()
+                    conn.close()
+                    return redirect(url_for("verify_phone", email=email))
 
         conn.close()
 
@@ -2267,7 +2604,7 @@ def verify_email():
 
 
 @app.route("/resend-email-otp", methods=["POST"])
-@limiter.limit("5 per minute")
+@limiter.limit("3 per minute")
 def resend_email_otp():
     """
     Resend the signup email OTP.
@@ -2306,7 +2643,7 @@ def resend_email_otp():
 
 
 @app.route("/verify-phone", methods=["GET", "POST"])
-@limiter.limit("5 per minute")
+@limiter.limit("15 per minute")
 def verify_phone():
     """
     Step 2 of 2 — verify phone OTP sent at signup.
@@ -2347,11 +2684,16 @@ def verify_phone():
             if MSG91_API_KEY:
                 valid = _verify_msg91_otp(user["phone"], entered)
             else:
-                valid = _verify_otp("phone", user["phone"], entered)
+                attempts = _get_otp_attempt_count("phone", user["phone"])
+                if attempts >= 5:
+                    error = "Too many verification attempts. Please try again later or request a new code."
+                    valid = False
+                else:
+                    valid = _verify_otp("phone", user["phone"], entered)
 
-            if not valid:
+            if not valid and not error:
                 error = "Incorrect OTP. Please try again."
-            else:
+            elif valid:
                 cursor.execute(
                     "UPDATE users SET phone_verified = TRUE, status = CASE WHEN email_verified IS TRUE THEN 'active' ELSE 'pending' END "
                     "WHERE email = %s",
@@ -2459,10 +2801,13 @@ def forgot_password():
             session["reset_identifier"] = identifier
 
             if user:
-                # Account found — generate OTP and send via email
+                # Account found — generate OTP and send via email or SMS
                 otp = _generate_otp()
                 _store_otp("reset", identifier, otp)
-                send_otp_email(identifier, otp, purpose="reset")
+                if "@" in identifier:
+                    send_otp_email(identifier, otp, purpose="reset")
+                else:
+                    send_otp_sms(identifier, otp, purpose="reset")
             # No else — silently do nothing if account doesn't exist
 
             conn.close()
@@ -2472,7 +2817,7 @@ def forgot_password():
 
 
 @app.route("/verify-reset-otp", methods=["GET", "POST"])
-@limiter.limit("5 per minute")
+@limiter.limit("15 per minute")
 def verify_reset_otp():
     """
     Forgot Password — Step 2: Verify OTP.
@@ -2503,13 +2848,17 @@ def verify_reset_otp():
 
         if not entered_otp:
             error = "Please enter the OTP."
-        elif not _verify_otp("reset", identifier, entered_otp):
-            error = "Incorrect OTP. Please try again."
         else:
-            # ✅ OTP verified — let them set a new password
-            session["reset_verified_id"] = user["id"]
-            session.pop("reset_identifier", None)
-            return redirect(url_for("reset_password"))
+            attempts = _get_otp_attempt_count("reset", identifier)
+            if attempts >= 5:
+                error = "Too many verification attempts. Please try again later or request a new code."
+            elif not _verify_otp("reset", identifier, entered_otp):
+                error = "Incorrect OTP. Please try again."
+            else:
+                # ✅ OTP verified — let them set a new password
+                session["reset_verified_id"] = user["id"]
+                session.pop("reset_identifier", None)
+                return redirect(url_for("reset_password"))
 
     return render_template(
         "auth/verify_reset_otp.html",
@@ -2519,7 +2868,7 @@ def verify_reset_otp():
 
 
 @app.route("/resend-reset-otp", methods=["POST"])
-@limiter.limit("5 per minute")
+@limiter.limit("3 per minute")
 def resend_reset_otp():
     """
     Resend a new OTP for password reset.
@@ -2531,7 +2880,10 @@ def resend_reset_otp():
 
     otp = _generate_otp()
     _store_otp("reset", identifier, otp)
-    send_otp_email(identifier, otp, purpose="reset")
+    if "@" in identifier:
+        send_otp_email(identifier, otp, purpose="reset")
+    else:
+        send_otp_sms(identifier, otp, purpose="reset")
     return redirect(url_for("verify_reset_otp"))
 
 

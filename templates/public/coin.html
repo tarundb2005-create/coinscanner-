@@ -157,7 +157,13 @@
       </div>
       {% endif %}
 
-      {% if coin.links %}
+      {% if coin.links and (
+        (coin.links.homepage and coin.links.homepage[0]) or
+        (coin.links.blockchain_site and coin.links.blockchain_site[0]) or
+        coin.links.subreddit_url or
+        (coin.links.repos_url and coin.links.repos_url.github and coin.links.repos_url.github[0]) or
+        coin.links.twitter_screen_name
+      ) %}
       <div class="cd-links-card">
         <h3 class="cd-section-title">Links</h3>
         <div class="cd-links-list">

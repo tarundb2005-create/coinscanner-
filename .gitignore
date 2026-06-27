@@ -6,17 +6,23 @@ __pycache__/
 *.pyd
 .Python
 
-# Environment
+# Environment — never commit secrets
 .env
+.env.local
+.env.*.local
 *.env
 
 # Database files — never commit production DB
 *.db
 *.sqlite3
+instance/
 
 # Python artifacts
 *.pyc
-instance/
+*.pyo
+*.pyd
+.Python
+*.egg-info/
 
 # macOS
 .DS_Store
@@ -27,9 +33,12 @@ instance/
 .idea/
 *.swp
 *.swo
+*.sublime-project
+*.sublime-workspace
 
-# Logs
+# Logs — never commit
 *.log
+logs/
 
 # Distribution
 dist/
@@ -41,6 +50,8 @@ build/
 venv/
 ENV/
 env/
+pip-log.txt
+pip-delete-this-directory.txt
 
 # Test / coverage
 htmlcov/
@@ -48,6 +59,19 @@ htmlcov/
 .nox/
 .pytest_cache/
 .coverage
+.coverage.*
+coverage.xml
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# OS
+Thumbs.db
+.DS_Store
+*.swp
+.#*
 .coverage.*
 
 # AWS / deployment

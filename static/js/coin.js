@@ -168,6 +168,8 @@ document.addEventListener("DOMContentLoaded", function () {
 
     // Render initial chart — fetch from browser on load
     (async function initChart() {
+      const loading = document.getElementById("chartLoading");
+      if (loading) loading.style.display = "flex";
       try {
         const symbol = coinId.toUpperCase();
         const data   = await fetchCandlesFromBrowser(symbol, 7);
@@ -179,6 +181,8 @@ document.addEventListener("DOMContentLoaded", function () {
           const initialData = JSON.parse(coinChartCanvas.dataset.prices || "[]");
           buildDetailChart(initialData);
         } catch(e2) {}
+      } finally {
+        if (loading) loading.style.display = "none";
       }
     })();
 

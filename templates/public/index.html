@@ -3,7 +3,9 @@
 {% block title %}Home{% endblock %}
 
 {% block content %}
-<meta http-equiv="refresh" content="0; url={{ url_for('home') }}">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'self';
+               img-src 'self' data: https://assets.coingecko.com https://assets.coincap.io;">
 <div style="padding:24px;text-align:center;color:#94A3B8;font-size:14px;">
     Redirecting to <a href="{{ url_for('home') }}">Home</a>...
 </div>

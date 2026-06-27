@@ -1,7 +1,8 @@
 """
 database.py - CoinScanner Database Layer
 ========================================
-Railway production database layer using PostgreSQL, with SQLite fallback for local development.
+Railway production database layer using PostgreSQL with connection pooling,
+with SQLite fallback for local development.
 """
 
 import os
@@ -11,9 +12,11 @@ import sqlite3
 try:
     import psycopg2
     from psycopg2.extras import RealDictCursor
+    from psycopg2.pool import SimpleConnectionPool
     HAS_POSTGRES = True
 except ImportError:
     HAS_POSTGRES = False
+    SimpleConnectionPool = None
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 USE_SQLITE = not HAS_POSTGRES or not DATABASE_URL or not DATABASE_URL.startswith(("postgresql://", "postgres://"))
@@ -120,8 +123,44 @@ class SQLiteConnectionWrapper:
         return getattr(self._connection, name)
 
 
+# ── PostgreSQL Connection Pool ────────────────────────────────
+_db_pool = None
+
+
+def _init_db_pool():
+    """
+    Initialize the PostgreSQL connection pool.
+    Called once at application startup.
+    
+    Pool configuration:
+      - minconn: 1 (minimum 1 idle connection)
+      - maxconn: 20 (maximum 20 connections)
+    """
+    global _db_pool
+    if USE_SQLITE or not HAS_POSTGRES or not DATABASE_URL:
+        return
+    
+    try:
+        _db_pool = SimpleConnectionPool(
+            minconn=1,
+            maxconn=20,
+            dsn=DATABASE_URL
+        )
+    except Exception as e:
+        print(f"Failed to initialize connection pool: {e}")
+        _db_pool = None
+
+
 def get_db_connection():
-    """Return a PostgreSQL connection, or SQLite connection for local development."""
+    """
+    Get a database connection from the pool (PostgreSQL) or direct connection (SQLite).
+    
+    For PostgreSQL: Returns a connection from the pool.
+    For SQLite: Returns a new SQLite connection.
+    
+    IMPORTANT: PostgreSQL connections must be released via release_db_connection()
+    when done to return them to the pool.
+    """
     if USE_SQLITE:
         db_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), "coinscanner.db")
         conn = sqlite3.connect(db_path)
@@ -129,11 +168,178 @@ def get_db_connection():
     else:
         if not DATABASE_URL:
             raise RuntimeError("DATABASE_URL environment variable is not set.")
-        return _ConnectionWrapper(psycopg2.connect(DATABASE_URL))
+        
+        # Use connection pool if available
+        if _db_pool:
+            try:
+                pg_conn = _db_pool.getconn()
+                return _ConnectionWrapper(pg_conn)
+            except Exception as e:
+                print(f"Failed to get connection from pool: {e}")
+                # Fallback to direct connection
+                return _ConnectionWrapper(psycopg2.connect(DATABASE_URL))
+        else:
+            return _ConnectionWrapper(psycopg2.connect(DATABASE_URL))
+
+
+def release_db_connection(conn):
+    """
+    Release a PostgreSQL connection back to the pool.
+    
+    IMPORTANT: Only call this for PostgreSQL connections obtained via get_db_connection().
+    SQLite connections will be closed normally.
+    
+    Args:
+        conn: The connection wrapper to release
+    """
+    if USE_SQLITE or not _db_pool:
+        # SQLite — just close normally
+        if hasattr(conn, 'close'):
+            conn.close()
+        return
+    
+    # PostgreSQL — return to pool
+    try:
+        # Extract the underlying psycopg2 connection from the wrapper
+        if isinstance(conn, _ConnectionWrapper):
+            pg_conn = conn._connection
+            _db_pool.putconn(pg_conn)
+        else:
+            conn.close()
+    except Exception as e:
+        print(f"Error returning connection to pool: {e}")
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def close_db_pool():
+    """
+    Close all connections in the pool and clean up.
+    Called at application shutdown.
+    """
+    global _db_pool
+    if _db_pool:
+        try:
+            _db_pool.closeall()
+            _db_pool = None
+        except Exception as e:
+            print(f"Error closing connection pool: {e}")
+
+
+
+
+def run_safe_migrations():
+    """
+    Run safe schema migrations.
+    
+    - Checks if columns/indexes exist before altering
+    - Prevents duplicate execution
+    - Maintains backward compatibility
+    - Does NOT run schema changes directly inside request flow
+    
+    Should be called once at application startup via init_db().
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        # ══════════════════════════════════════════════════════════
+        # Migration 1: Add missing columns to users table
+        # ══════════════════════════════════════════════════════════
+        new_columns = [
+            ("failed_attempts", "INTEGER DEFAULT 0"),
+            ("locked_until", "INTEGER DEFAULT 0"),
+            ("session_version", "INTEGER DEFAULT 0"),
+            ("email_verified", "BOOLEAN DEFAULT FALSE"),
+            ("phone_verified", "BOOLEAN DEFAULT FALSE"),
+            ("status", "VARCHAR(20) DEFAULT 'pending'"),
+        ]
+        for col_name, col_def in new_columns:
+            try:
+                if USE_SQLITE:
+                    # Check if column exists in SQLite
+                    cursor.execute("PRAGMA table_info(users)")
+                    columns = [row["name"] for row in cursor.fetchall()]
+                    if col_name not in columns:
+                        cursor.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_def}")
+                        conn.commit()
+                else:
+                    cursor.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col_name} {col_def}")
+                    conn.commit()
+            except Exception as e:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+        
+        # ══════════════════════════════════════════════════════════
+        # Migration 2: Populate user status for older databases
+        # ══════════════════════════════════════════════════════════
+        try:
+            cursor.execute(
+                "UPDATE users SET status = 'active' "
+                "WHERE email_verified IS TRUE AND phone_verified IS TRUE"
+            )
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        
+        # Handle legacy is_verified column if it exists
+        try:
+            cursor.execute(
+                "UPDATE users SET status = 'active' WHERE is_verified IS TRUE"
+            )
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        
+        # ══════════════════════════════════════════════════════════
+        # Migration 3: Create database indexes for performance
+        # ══════════════════════════════════════════════════════════
+        indexes = [
+            "CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);",
+            "CREATE INDEX IF NOT EXISTS idx_users_phone ON users(phone);",
+            "CREATE INDEX IF NOT EXISTS idx_login_identifier ON login_log(identifier);",
+            "CREATE INDEX IF NOT EXISTS idx_coin_watchlist_user_id ON coin_watchlist(user_id);",
+            "CREATE INDEX IF NOT EXISTS idx_exchange_watchlist_user_id ON exchange_watchlist(user_id);",
+        ]
+        
+        for index_sql in indexes:
+            try:
+                cursor.execute(index_sql)
+                conn.commit()
+            except Exception as e:
+                # Index might already exist or syntax differs for SQLite
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+    
+    except Exception as e:
+        print(f"Error running migrations: {e}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    finally:
+        release_db_connection(conn)
 
 
 def init_db():
-    """Create tables and run lightweight migrations if needed."""
+    """
+    Create all required database tables.
+    Then run all safe migrations.
+    
+    Called once at application startup.
+    """
     conn = get_db_connection()
     cursor = conn.cursor()
 
@@ -195,65 +401,23 @@ def init_db():
         exchange_watchlist_ddl = exchange_watchlist_ddl.replace("SERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
         login_log_ddl = login_log_ddl.replace("SERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
 
-    cursor.execute(users_ddl)
-
-    new_columns = [
-        ("failed_attempts", "INTEGER DEFAULT 0"),
-        ("locked_until", "INTEGER DEFAULT 0"),
-        ("session_version", "INTEGER DEFAULT 0"),
-        ("email_verified", "BOOLEAN DEFAULT FALSE"),
-        ("phone_verified", "BOOLEAN DEFAULT FALSE"),
-        ("status", "VARCHAR(20) DEFAULT 'pending'"),
-    ]
-    for col_name, col_def in new_columns:
-        try:
-            if USE_SQLITE:
-                # Check if column exists in SQLite
-                cursor.execute("PRAGMA table_info(users)")
-                columns = [row["name"] for row in cursor.fetchall()]
-                if col_name not in columns:
-                    cursor.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_def}")
-                    conn.commit()
-            else:
-                cursor.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col_name} {col_def}")
-                conn.commit()
-        except Exception:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-
-    # Populate a user status for older databases.
-    # Active if both email and phone were already verified, otherwise pending.
     try:
-        cursor.execute(
-            "UPDATE users SET status = 'active' "
-            "WHERE email_verified IS TRUE AND phone_verified IS TRUE"
-        )
+        cursor.execute(users_ddl)
+        cursor.execute(coin_watchlist_ddl)
+        cursor.execute(exchange_watchlist_ddl)
+        cursor.execute(login_log_ddl)
         conn.commit()
-    except Exception:
+    except Exception as e:
+        print(f"Error creating tables: {e}")
         try:
             conn.rollback()
         except Exception:
             pass
-
-    try:
-        cursor.execute(
-            "UPDATE users SET status = 'active' WHERE is_verified IS TRUE"
-        )
-        conn.commit()
-    except Exception:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-
-    cursor.execute(coin_watchlist_ddl)
-    cursor.execute(exchange_watchlist_ddl)
-    cursor.execute(login_log_ddl)
-
-    conn.commit()
-    conn.close()
+    finally:
+        release_db_connection(conn)
+    
+    # Run all migrations after tables are created
+    run_safe_migrations()
 
 
 def purge_old_logs(days=90):
@@ -269,4 +433,4 @@ def purge_old_logs(days=90):
         except Exception:
             pass
     finally:
-        conn.close()
+        release_db_connection(conn)

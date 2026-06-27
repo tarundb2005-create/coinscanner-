@@ -17,17 +17,17 @@
     'use strict';
 
     // ── Config ──────────────────────────────────────────
-    const PER_PAGE     = 25;
-    const SENTINEL_ID  = 'coinsSentinel';
-    const SPINNER_ID   = 'coinsSpinner';
-    const ALL_DONE_ID  = 'coinsAllLoaded';
+    const PER_PAGE = 25;
+    const SENTINEL_ID = 'coinsSentinel';
+    const SPINNER_ID = 'coinsSpinner';
+    const ALL_DONE_ID = 'coinsAllLoaded';
 
     // ── State ────────────────────────────────────────────
     // Page 1 is already rendered by server. Start fetching from page 2.
     // We track how many coins the server already rendered.
-    let currentPage    = 1;
-    let isLoading      = false;
-    let allLoaded      = false;
+    let currentPage = 1;
+    let isLoading = false;
+    let allLoaded = false;
 
     // ── Detect active view (table or card) ───────────────
     function getActiveView() {
@@ -63,34 +63,34 @@
     function fmtPrice(val, currency) {
         if (!val || isNaN(val)) return '—';
         const sym = currency === 'usd' ? '$' : '₹';
-        if (val < 0.01)  return sym + val.toFixed(6);
-        if (val < 1)     return sym + val.toFixed(4);
+        if (val < 0.01) return sym + val.toFixed(6);
+        if (val < 1) return sym + val.toFixed(4);
         return sym + Number(val).toLocaleString('en-IN', { maximumFractionDigits: 2 });
     }
 
     function fmtMcap(val) {
         if (!val) return '—';
         const cr = val / 1e7;
-        if (cr >= 1e5)  return '₹' + (cr / 1e5).toFixed(2) + ' L Cr';
+        if (cr >= 1e5) return '₹' + (cr / 1e5).toFixed(2) + ' L Cr';
         if (cr >= 1000) return '₹' + Number(cr.toFixed(0)).toLocaleString('en-IN') + ' Cr';
         return '₹' + cr.toFixed(1) + ' Cr';
     }
 
     function fmtChg(val) {
         if (val === null || val === undefined) return '—';
-        const up  = val >= 0;
+        const up = val >= 0;
         const abs = Math.abs(val).toFixed(2);
         return `<span class="ct-pill ${up ? 'up' : 'dn'}">${up ? '▲' : '▼'} ${abs}%</span>`;
     }
 
     // ── Build a table row from API coin data ──────────────
     function buildTableRow(coin) {
-        const currency  = getActiveCurrency();
-        const price     = fmtPrice(coin.current_price, currency);
-        const mcap      = fmtMcap(coin.market_cap);
-        const chg24     = fmtChg(coin.price_change_percentage_24h);
-        const chg7d     = fmtChg(coin.price_change_percentage_7d);
-        const sparkId   = 'spark-' + coin.id;
+        const currency = getActiveCurrency();
+        const price = fmtPrice(coin.current_price, currency);
+        const mcap = fmtMcap(coin.market_cap);
+        const chg24 = fmtChg(coin.price_change_percentage_24h);
+        const chg7d = fmtChg(coin.price_change_percentage_7d);
+        const sparkId = 'spark-' + coin.id;
         const sparkData = JSON.stringify(coin.sparkline || []);
 
         return `
@@ -113,9 +113,12 @@
     <div class="ct-rank">${coin.market_cap_rank || '—'}</div>
 
     <div class="ct-coin">
-        <img src="${coin.image || ''}" alt="${coin.name}"
+        <img src="${coin.image || '/static/images/default-coin.png'}" alt="${coin.name}"
              class="ct-logo"
-             onerror="this.style.display='none'">
+             onerror="this.style.display='none'; this.nextElementSibling?.style.display='flex'">
+        <div class="ct-logo-fallback" style="display:none; align-items:center; justify-content:center; width:32px; height:32px; background:#f0f0f0; border-radius:50%; font-weight:bold; color:#666; font-size:14px;">
+            ${coin.symbol ? coin.symbol[0].toUpperCase() : '?'}
+        </div>
         <div>
             <div class="ct-name">
                 ${coin.name}
@@ -144,11 +147,11 @@
     // ── Build a card from API coin data ──────────────────
     function buildCard(coin) {
         const currency = getActiveCurrency();
-        const price    = fmtPrice(coin.current_price, currency);
-        const chg      = coin.price_change_percentage_24h || 0;
-        const up       = chg >= 0;
-        const chgAbs   = Math.abs(chg).toFixed(2);
-        const sym      = (coin.symbol || '').toUpperCase();
+        const price = fmtPrice(coin.current_price, currency);
+        const chg = coin.price_change_percentage_24h || 0;
+        const up = chg >= 0;
+        const chgAbs = Math.abs(chg).toFixed(2);
+        const sym = (coin.symbol || '').toUpperCase();
 
         return `
 <div class="mover-card coin-card ${up ? 'gain-card' : 'lose-card'}"
@@ -180,8 +183,12 @@
         </button>
     </div>
     <div class="mover-identity">
-        <img src="${coin.image || ''}" alt="${coin.name}" class="mover-logo"
-             onerror="this.style.display='none'">
+        <img src="${coin.image || '/static/images/default-coin.png'}" alt="${coin.name}" 
+             class="mover-logo"
+             onerror="this.style.display='none'; this.nextElementSibling?.style.display='flex'">
+        <div class="mover-logo-fallback" style="display:none; align-items:center; justify-content:center; width:40px; height:40px; background:#f0f0f0; border-radius:50%; font-weight:bold; color:#666; font-size:16px;">
+            ${coin.symbol ? coin.symbol[0].toUpperCase() : '?'}
+        </div>
         <div class="mover-name-wrap">
             <span class="mover-name">${coin.name}</span>
             <span class="mover-symbol">${sym} · #${coin.market_cap_rank || '—'}</span>
@@ -219,20 +226,20 @@
     function loadNextPage() {
         if (isLoading || allLoaded) return;
 
-        const view      = getActiveView();
+        const view = getActiveView();
         const container = getContainer(view);
         if (!container) return;
 
         const sentinel = document.getElementById(SENTINEL_ID);
-        const spinner  = document.getElementById(SPINNER_ID);
-        const allDone  = document.getElementById(ALL_DONE_ID);
+        const spinner = document.getElementById(SPINNER_ID);
+        const allDone = document.getElementById(ALL_DONE_ID);
 
         isLoading = true;
         if (spinner) spinner.style.display = 'block';
 
         const nextPage = currentPage + 1;
         const currency = getActiveCurrency();
-        const url      = `/api/coins?page=${nextPage}&per_page=${PER_PAGE}&currency=${currency}`;
+        const url = `/api/coins?page=${nextPage}&per_page=${PER_PAGE}&currency=${currency}`;
 
         fetch(url)
             .then(function (res) {
@@ -275,7 +282,7 @@
 
                 if (allLoaded) {
                     if (sentinel) sentinel.style.display = 'none';
-                    if (allDone)  allDone.style.display  = 'block';
+                    if (allDone) allDone.style.display = 'block';
                 }
             })
             .catch(function (err) {
@@ -293,7 +300,7 @@
         if (!sentinel) return;
 
         // Calculate how many coins were already rendered by server
-        const view      = getActiveView();
+        const view = getActiveView();
         const container = getContainer(view);
         if (container) {
             const renderedCount = container.querySelectorAll(
