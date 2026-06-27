@@ -6,6 +6,7 @@
 {% set sym  = "$" if currency == "usd" else "₹" %}
 {% set curr = currency if currency else "inr" %}
 {% set md   = coin.market_data %}
+{% set price_inr = md.current_price.get('inr', 0) if md else 0 %}
 {% set price    = md.current_price.get(curr, 0) if md else 0 %}
 {% set change24 = md.price_change_percentage_24h if md else 0 %}
 {% set is_up    = change24 and change24 > 0 %}
@@ -34,7 +35,7 @@
       </div>
     </div>
     <div class="cd-hero-right">
-      <div class="cd-price">{{ sym }}{{ "{:,.6f}".format(price) if price < 0.01 else ("{:,.4f}".format(price) if price < 1 else "{:,.2f}".format(price)) }}</div>
+      <div class="cd-price" data-id="{{ coin.id }}" data-price-inr="{{ price_inr }}">{{ sym }}{{ "{:,.6f}".format(price) if price < 0.01 else ("{:,.4f}".format(price) if price < 1 else "{:,.2f}".format(price)) }}</div>
       {% if change24 %}
       <div class="cd-change-pill {{ 'up' if is_up else 'down' }}">
         {{ "▲" if is_up else "▼" }} {{ "{:.2f}".format(change24|abs) }}%
@@ -81,15 +82,17 @@
         </div>
         {% set low  = md.low_24h.get(curr,0) %}
         {% set high = md.high_24h.get(curr,0) %}
+        {% set low_inr  = md.low_24h.get('inr',0) %}
+        {% set high_inr = md.high_24h.get('inr',0) %}
         {% set pct  = ((price - low) / (high - low) * 100) if (high - low) > 0 else 50 %}
         <div class="cd-range-row">
-          <span class="cd-range-low">{{ sym }}{{ "{:,.2f}".format(low) }}</span>
+          <span class="cd-range-low" data-price-inr="{{ low_inr }}">{{ sym }}{{ "{:,.2f}".format(low) }}</span>
           {% set safepct = pct|int %}
           {% set safepct = 95 if safepct > 95 else (2 if safepct < 2 else safepct) %}
           <div class="cd-range-track">
             <div class="cd-range-dot" style="left:calc({{ safepct }}% - 6px)"></div>
           </div>
-          <span class="cd-range-high">{{ sym }}{{ "{:,.2f}".format(high) }}</span>
+          <span class="cd-range-high" data-price-inr="{{ high_inr }}">{{ sym }}{{ "{:,.2f}".format(high) }}</span>
         </div>
       </div>
 
@@ -99,24 +102,28 @@
         <div class="cd-stat-card">
           <span class="cd-stat-label"><i class="fa-solid fa-chart-pie"></i> Market Cap</span>
           {% set mc = md.market_cap.get(curr,0) %}
-          <strong class="cd-stat-val">{% if mc %}{{ sym }}{{ "{:,.0f}".format(mc) }}{% else %}—{% endif %}</strong>
+          {% set mc_inr = md.market_cap.get('inr',0) %}
+          <strong class="cd-stat-val cd-mcap-val" data-price-inr="{{ mc_inr }}">{% if mc %}{{ sym }}{{ "{:,.0f}".format(mc) }}{% else %}—{% endif %}</strong>
         </div>
 
         <div class="cd-stat-card">
           <span class="cd-stat-label"><i class="fa-solid fa-arrow-right-arrow-left"></i> 24h Volume</span>
-          <strong class="cd-stat-val">{{ sym }}{{ "{:,.0f}".format(md.total_volume.get(curr,0)) }}</strong>
+          {% set vol_inr = md.total_volume.get('inr',0) %}
+          <strong class="cd-stat-val cd-volume-val" data-price-inr="{{ vol_inr }}">{{ sym }}{{ "{:,.0f}".format(md.total_volume.get(curr,0)) }}</strong>
         </div>
 
         <div class="cd-stat-card">
           <span class="cd-stat-label"><i class="fa-solid fa-trophy"></i> All Time High</span>
           {% set ath_val = md.ath.get(curr,0) %}
-          <strong class="cd-stat-val cd-ath">{% if ath_val %}{{ sym }}{{ "{:,.6f}".format(ath_val) if ath_val < 1 else "{:,.2f}".format(ath_val) }}{% else %}—{% endif %}</strong>
+          {% set ath_inr = md.ath.get('inr',0) %}
+          <strong class="cd-stat-val cd-ath-val" data-price-inr="{{ ath_inr }}">{% if ath_val %}{{ sym }}{{ "{:,.6f}".format(ath_val) if ath_val < 1 else "{:,.2f}".format(ath_val) }}{% else %}—{% endif %}</strong>
         </div>
 
         <div class="cd-stat-card">
           <span class="cd-stat-label"><i class="fa-solid fa-arrow-trend-down"></i> All Time Low</span>
           {% set atl_val = md.atl.get(curr,0) %}
-          <strong class="cd-stat-val">{% if atl_val %}{{ sym }}{{ "{:,.6f}".format(atl_val) if atl_val < 1 else "{:,.2f}".format(atl_val) }}{% else %}—{% endif %}</strong>
+          {% set atl_inr = md.atl.get('inr',0) %}
+          <strong class="cd-stat-val cd-atl-val" data-price-inr="{{ atl_inr }}">{% if atl_val %}{{ sym }}{{ "{:,.6f}".format(atl_val) if atl_val < 1 else "{:,.2f}".format(atl_val) }}{% else %}—{% endif %}</strong>
         </div>
 
         <div class="cd-stat-card">
@@ -133,8 +140,10 @@
 
         <div class="cd-stat-card">
           <span class="cd-stat-label"><i class="fa-solid fa-building-columns"></i> Fully Diluted Val</span>
-          <strong class="cd-stat-val">
-            {% if md.fully_diluted_valuation and md.fully_diluted_valuation.get(curr) %}{{ sym }}{{ "{:,.0f}".format(md.fully_diluted_valuation.get(curr)) }}{% else %}N/A{% endif %}
+          {% set fdv = md.fully_diluted_valuation.get(curr,0) if md.fully_diluted_valuation else 0 %}
+          {% set fdv_inr = md.fully_diluted_valuation.get('inr',0) if md.fully_diluted_valuation else 0 %}
+          <strong class="cd-stat-val cd-fdv-val" data-price-inr="{{ fdv_inr }}">
+            {% if fdv %}{{ sym }}{{ "{:,.0f}".format(fdv) }}{% else %}N/A{% endif %}
           </strong>
         </div>
 

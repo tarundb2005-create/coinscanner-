@@ -36,7 +36,7 @@
    1. toggleAbout() — called inline from coin.html
    Expands/collapses the "About" description section.
    Called: onclick="toggleAbout()"
-══════════════════════════════════════════════════════ */
+ ══════════════════════════════════════════════════════ */
 function toggleAbout() {
   const shortEl = document.getElementById("aboutShort");
   const fullEl  = document.getElementById("aboutFull");
@@ -52,8 +52,164 @@ function toggleAbout() {
 
 /* ══════════════════════════════════════════════════════
    MAIN — runs after DOM is ready
-══════════════════════════════════════════════════════ */
+ ══════════════════════════════════════════════════════ */
 document.addEventListener("DOMContentLoaded", function () {
+
+  // ── Global Currency State ───────────────────────────
+  let currentCurrency = window.globalCurrency
+                     || localStorage.getItem("preferredCurrency")
+                     || "inr";
+  let usdRates   = {};
+  let usdFetched = false;
+
+  // ── Format Helpers ──────────────────────────────────
+  function fmtINR(n) {
+    if (!n || isNaN(n)) return "₹0";
+    n = parseFloat(n);
+    const LAKH_CR = 1e13, CR = 1e7, LAKH = 1e5, K = 1e3;
+    if (n >= LAKH_CR) return "₹" + (n / LAKH_CR).toFixed(2) + " L.Cr";
+    if (n >= CR) {
+      const cr = n / CR;
+      return "₹" + (cr >= 1000 ? cr.toLocaleString("en-IN", { maximumFractionDigits: 0 }) : cr.toFixed(1)) + " Cr";
+    }
+    if (n >= LAKH) return "₹" + (n / LAKH).toFixed(2) + " L";
+    if (n >= K)    return "₹" + (n / K).toFixed(2) + " K";
+    return "₹" + n.toLocaleString("en-IN", { maximumFractionDigits: 2 });
+  }
+
+  // Format USD with dynamic suffix (T/B/M/K)
+  function fmtUSD(n) {
+    if (!n || isNaN(n)) return "$0";
+    n = parseFloat(n);
+    if (n >= 1e12) return "$" + (n / 1e12).toFixed(2) + "T";
+    if (n >= 1e9)  return "$" + (n / 1e9).toFixed(2)  + "B";
+    if (n >= 1e6)  return "$" + (n / 1e6).toFixed(2)  + "M";
+    if (n >= 1e3)  return "$" + (n / 1e3).toFixed(2)  + "K";
+    return "$" + n.toLocaleString("en-US", { maximumFractionDigits: 2 });
+  }
+
+  function fmtPrice(inrVal, id) {
+    if (currentCurrency === "usd" && usdRates[id]) return fmtUSD(usdRates[id]);
+    return fmtINR(inrVal);
+  }
+
+  function formatDetailStat(val) {
+    if (!val || isNaN(val)) return "—";
+    val = parseFloat(val);
+    if (currentCurrency === "usd") {
+      const rate = window.usdInrRate || 84.5;
+      const usd = val / rate;
+      return fmtUSD(usd);
+    }
+    return fmtINR(val);
+  }
+
+  async function fetchUSD() {
+    const ids = [...new Set(
+      [...document.querySelectorAll("[data-id]")]
+        .map(function (c) { return c.dataset.id; })
+        .filter(Boolean)
+    )];
+    if (!ids.length) return;
+
+    let USDINR = 84.5;
+    try {
+      const res    = await fetch("https://api.exchangerate-api.com/v4/latest/USD");
+      if (res.ok) {
+        const data   = await res.json();
+        USDINR = data.rates?.INR || 84.5;
+      }
+    } catch (e) {
+      console.warn("USD fetch error, using fallback rate 84.5:", e);
+    }
+
+    document.querySelectorAll("[data-price-inr]").forEach(function (el) {
+      const inr = parseFloat(el.dataset.priceInr);
+      if (inr && el.dataset.id) usdRates[el.dataset.id] = inr / USDINR;
+    });
+    usdFetched = true;
+    window.usdInrRate = USDINR;
+    window.usdRates = usdRates;
+  }
+
+  function updateAllPrices() {
+    // Detail page main price
+    const detailPriceEl = document.querySelector(".cd-price[data-id]");
+    if (detailPriceEl) {
+      detailPriceEl.textContent = fmtPrice(detailPriceEl.dataset.priceInr, detailPriceEl.dataset.id);
+    }
+
+    // Detail page 24h range low & high
+    const rangeLowEl = document.querySelector(".cd-range-low");
+    const rangeHighEl = document.querySelector(".cd-range-high");
+    if (rangeLowEl) rangeLowEl.textContent = formatDetailStat(rangeLowEl.dataset.priceInr);
+    if (rangeHighEl) rangeHighEl.textContent = formatDetailStat(rangeHighEl.dataset.priceInr);
+
+    // Detail page 24h range badge
+    const rangeBadge = document.querySelector(".cd-range-badge");
+    if (rangeBadge) rangeBadge.textContent = currentCurrency.toUpperCase();
+
+    // Detail page stats cards
+    const mcapVal = document.querySelector(".cd-mcap-val");
+    if (mcapVal) mcapVal.textContent = formatDetailStat(mcapVal.dataset.priceInr);
+
+    const volumeVal = document.querySelector(".cd-volume-val");
+    if (volumeVal) volumeVal.textContent = formatDetailStat(volumeVal.dataset.priceInr);
+
+    const athVal = document.querySelector(".cd-ath-val");
+    if (athVal) athVal.textContent = formatDetailStat(athVal.dataset.priceInr);
+
+    const atlVal = document.querySelector(".cd-atl-val");
+    if (atlVal) atlVal.textContent = formatDetailStat(atlVal.dataset.priceInr);
+
+    const fdvVal = document.querySelector(".cd-fdv-val");
+    if (fdvVal) fdvVal.textContent = formatDetailStat(fdvVal.dataset.priceInr);
+
+    // Mover table rows — .mover-row with .mover-td-price child
+    document.querySelectorAll(".mover-row[data-id]").forEach(function (el) {
+      const priceEl = el.querySelector(".mover-td-price");
+      if (priceEl) priceEl.textContent = fmtPrice(el.dataset.priceInr, el.dataset.id);
+    });
+
+    // Mover card rows — .mover-card (home page mover format on coins page)
+    document.querySelectorAll(".mover-card[data-id]").forEach(function (el) {
+      const priceEl = el.querySelector(".mover-price, .price-cell");
+      if (priceEl) priceEl.textContent = fmtPrice(el.dataset.priceInr, el.dataset.id);
+    });
+
+    // Card grid — .coin-card with .coin-price child
+    document.querySelectorAll(".coins-grid .coin-card[data-id]").forEach(function (el) {
+      const priceEl = el.querySelector(".coin-price");
+      if (priceEl) priceEl.textContent = fmtPrice(el.dataset.priceInr, el.dataset.id);
+    });
+
+    // Main coins table rows — .coin-row with .td-price child
+    document.querySelectorAll(".coins-table tbody .coin-row[data-id]").forEach(function (el) {
+      const priceEl = el.querySelector(".td-price");
+      if (priceEl) priceEl.textContent = fmtPrice(el.dataset.priceInr, el.dataset.id);
+    });
+
+    // Any remaining .price-cell in a .coin-row (catches home page if loaded)
+    document.querySelectorAll(".coin-row[data-id]").forEach(function (row) {
+      const el = row.querySelector(".price-cell");
+      if (el) el.textContent = fmtPrice(row.dataset.priceInr, row.dataset.id);
+    });
+  }
+
+  // Currency event listener
+  window.addEventListener("currencyChanged", async function (e) {
+    currentCurrency = e.detail.currency;
+    if (currentCurrency === "usd" && !usdFetched) await fetchUSD();
+    updateAllPrices();
+  });
+
+  // Initial check on page load: if preferred currency is USD, fetch rates and update
+  if (currentCurrency === "usd") {
+    (async function () {
+      await fetchUSD();
+      updateAllPrices();
+    })();
+  }
 
   /* ══════════════════════════════════════════════════════
      2. COIN DETAIL PAGE — Chart + Period Buttons
@@ -65,10 +221,9 @@ document.addEventListener("DOMContentLoaded", function () {
 
   if (coinChartCanvas) {
     // Read currency and coin ID from data attributes on the canvas element
-    // These are set in coin.html: <canvas id="coinChart" data-currency="inr" data-coin-id="bitcoin">
-    const pageCurrency = coinChartCanvas.dataset.currency || "inr";
     const coinId       = coinChartCanvas.dataset.coinId   || "";
-    const symbol       = pageCurrency === "usd" ? "$" : "₹";
+    let chartSymbol    = currentCurrency === "usd" ? "$" : "₹";
+    let rawChartData   = null;
 
     let detailChart = null;   // holds the Chart.js instance
 
@@ -116,7 +271,7 @@ document.addEventListener("DOMContentLoaded", function () {
             tooltip: {
               callbacks: {
                 label: function (item) {
-                  return " " + symbol + parseFloat(item.raw).toLocaleString("en-IN", { maximumFractionDigits: 6 });
+                  return " " + chartSymbol + parseFloat(item.raw).toLocaleString("en-IN", { maximumFractionDigits: 6 });
                 },
               },
             },
@@ -134,11 +289,11 @@ document.addEventListener("DOMContentLoaded", function () {
                 color: "#94a3b8",
                 font:  { size: 11 },
                 callback: function (v) {
-                  if (v >= 1e6)  return symbol + (v / 1e6).toFixed(1) + "M";
-                  if (v >= 1e3)  return symbol + v.toLocaleString("en-IN", { maximumFractionDigits: 0 });
-                  if (v >= 1)    return symbol + parseFloat(v.toFixed(2));
-                  if (v >= 0.01) return symbol + parseFloat(v.toFixed(4));
-                  return symbol + parseFloat(v.toFixed(6));
+                  if (v >= 1e6)  return chartSymbol + (v / 1e6).toFixed(1) + "M";
+                  if (v >= 1e3)  return chartSymbol + v.toLocaleString("en-IN", { maximumFractionDigits: 0 });
+                  if (v >= 1)    return chartSymbol + parseFloat(v.toFixed(2));
+                  if (v >= 0.01) return chartSymbol + parseFloat(v.toFixed(4));
+                  return chartSymbol + parseFloat(v.toFixed(6));
                 },
               },
             },
@@ -157,13 +312,25 @@ document.addEventListener("DOMContentLoaded", function () {
       if (!res.ok) throw new Error("CoinDCX candles error " + res.status);
       const candles = await res.json();
       if (!Array.isArray(candles)) throw new Error("Unexpected candle format");
-      // CoinDCX candles are objects: {time, open, high, low, close, volume}
-      // sorted descending by time — reverse to get oldest→newest for chart
+      // CoinDCX candles are objects: {time, open, close, etc.}
       return candles.slice().reverse().map(function(c) {
         const ts    = c.time || (c[0] * 1000);   // ms timestamp
         const close = c.close != null ? parseFloat(c.close) : parseFloat(c[4]);
         return [ts, close];
       }).filter(function(p) { return p[1] > 0; });
+    }
+
+    function renderChartWithCurrency() {
+      if (!rawChartData || !rawChartData.length) return;
+      chartSymbol = currentCurrency === "usd" ? "$" : "₹";
+      let dataToRender = rawChartData;
+      if (currentCurrency === "usd") {
+        const rate = window.usdInrRate || 84.5;
+        dataToRender = rawChartData.map(function(p) {
+          return [p[0], p[1] / rate];
+        });
+      }
+      buildDetailChart(dataToRender);
     }
 
     // Render initial chart — fetch from browser on load
@@ -173,13 +340,15 @@ document.addEventListener("DOMContentLoaded", function () {
       try {
         const symbol = coinId.toUpperCase();
         const data   = await fetchCandlesFromBrowser(symbol, 7);
-        buildDetailChart(data);
+        rawChartData = data;
+        renderChartWithCurrency();
       } catch (e) {
         console.error("Chart init error:", e);
         // Try server-side data as fallback
         try {
           const initialData = JSON.parse(coinChartCanvas.dataset.prices || "[]");
-          buildDetailChart(initialData);
+          rawChartData = initialData;
+          renderChartWithCurrency();
         } catch(e2) {}
       } finally {
         if (loading) loading.style.display = "none";
@@ -204,7 +373,8 @@ document.addEventListener("DOMContentLoaded", function () {
         try {
           const symbol = coinId.toUpperCase();
           const data   = await fetchCandlesFromBrowser(symbol, days);
-          buildDetailChart(data);
+          rawChartData = data;
+          renderChartWithCurrency();
         } catch (e) {
           console.error("Period chart fetch error:", e);
         } finally {
@@ -212,6 +382,11 @@ document.addEventListener("DOMContentLoaded", function () {
           if (container) container.style.opacity = "1";
         }
       });
+    });
+
+    // Listen to currency changed specifically to re-render the chart
+    window.addEventListener("currencyChanged", function () {
+      renderChartWithCurrency();
     });
 
     // IMPORTANT: return early — don't run coins-list code on the detail page
@@ -410,154 +585,11 @@ document.addEventListener("DOMContentLoaded", function () {
 
 
   /* ══════════════════════════════════════════════════════
-     7. FORMAT HELPERS
-     Kept in sync with home.js — same functions.
-     Separate because coin.js needs its own scope with
-     its own currentCurrency and usdRates variables.
-  ══════════════════════════════════════════════════════ */
-
-  /** Format INR using Indian number system. */
-  function fmtINR(n) {
-    if (!n || isNaN(n)) return "₹0";
-    n = parseFloat(n);
-    const LAKH_CR = 1e13, CR = 1e7, LAKH = 1e5, K = 1e3;
-    if (n >= LAKH_CR) return "₹" + (n / LAKH_CR).toFixed(2) + " L.Cr";
-    if (n >= CR) {
-      const cr = n / CR;
-      return "₹" + (cr >= 1000 ? cr.toLocaleString("en-IN", { maximumFractionDigits: 0 }) : cr.toFixed(1)) + " Cr";
-    }
-    if (n >= LAKH) return "₹" + (n / LAKH).toFixed(2) + " L";
-    if (n >= K)    return "₹" + (n / K).toFixed(2) + " K";
-    return "₹" + n.toLocaleString("en-IN", { maximumFractionDigits: 2 });
-  }
-
-  /** Format USD using international system. */
-  function fmtUSD(n) {
-    if (!n || isNaN(n)) return "$0";
-    n = parseFloat(n);
-    if (n >= 1e12) return "$" + (n / 1e12).toFixed(2) + "T";
-    if (n >= 1e9)  return "$" + (n / 1e9).toFixed(2)  + "B";
-    if (n >= 1e6)  return "$" + (n / 1e6).toFixed(2)  + "M";
-    if (n >= 1e3)  return "$" + (n / 1e3).toFixed(2)  + "K";
-    return "$" + n.toLocaleString("en-US", { maximumFractionDigits: 2 });
-  }
-
-  /**
-   * Format a price in the current currency.
-   * @param {number|string} inrVal - INR price from data-price-inr
-   * @param {string}        id     - CoinGecko coin ID
-   */
-  function fmtPrice(inrVal, id) {
-    if (currentCurrency === "usd" && usdRates[id]) return fmtUSD(usdRates[id]);
-    return fmtINR(inrVal);
-  }
-
-
-  /* ══════════════════════════════════════════════════════
-     8. USD RATES FETCH
-     Fetches USD prices, market caps, highs, lows, ATH, volumes
-     for all coins visible on the page.
-     Called once when user first switches to USD.
-  ══════════════════════════════════════════════════════ */
-  let currentCurrency = window.globalCurrency
-                     || localStorage.getItem("preferredCurrency")
-                     || "inr";
-  let usdRates   = {};
-  let usdFetched = false;
-
-  async function fetchUSD() {
-    const ids = [...new Set(
-      [...document.querySelectorAll("[data-id]")]
-        .map(function (c) { return c.dataset.id; })
-        .filter(Boolean)
-    )];
-    if (!ids.length) return;
-
-    let USDINR = 84.5;
-    try {
-      const res    = await fetch("https://api.exchangerate-api.com/v4/latest/USD");
-      if (res.ok) {
-        const data   = await res.json();
-        USDINR = data.rates?.INR || 84.5;
-      }
-    } catch (e) {
-      console.warn("USD fetch error, using fallback rate 84.5:", e);
-    }
-
-    document.querySelectorAll("[data-price-inr]").forEach(function (el) {
-      const inr = parseFloat(el.dataset.priceInr);
-      if (inr && el.dataset.id) usdRates[el.dataset.id] = inr / USDINR;
-    });
-    usdFetched = true;
-    window.usdInrRate = USDINR;
-    window.usdRates = usdRates;
-  }
-
-
-  /* ══════════════════════════════════════════════════════
-     9. UPDATE ALL PRICES ON SCREEN
-     Sweeps through every price element and updates it.
-     Covers: mover table rows, card grid, main table, home rows.
-  ══════════════════════════════════════════════════════ */
-  function updateAllPrices() {
-    // Mover table rows — .mover-row with .mover-td-price child
-    document.querySelectorAll(".mover-row[data-id]").forEach(function (el) {
-      const priceEl = el.querySelector(".mover-td-price");
-      if (priceEl) priceEl.textContent = fmtPrice(el.dataset.priceInr, el.dataset.id);
-    });
-
-    // Mover card rows — .mover-card (home page mover format on coins page)
-    document.querySelectorAll(".mover-card[data-id]").forEach(function (el) {
-      const priceEl = el.querySelector(".mover-price, .price-cell");
-      if (priceEl) priceEl.textContent = fmtPrice(el.dataset.priceInr, el.dataset.id);
-    });
-
-    // Card grid — .coin-card with .coin-price child
-    document.querySelectorAll(".coins-grid .coin-card[data-id]").forEach(function (el) {
-      const priceEl = el.querySelector(".coin-price");
-      if (priceEl) priceEl.textContent = fmtPrice(el.dataset.priceInr, el.dataset.id);
-    });
-
-    // Main coins table rows — .coin-row with .td-price child
-    document.querySelectorAll(".coins-table tbody .coin-row[data-id]").forEach(function (el) {
-      const priceEl = el.querySelector(".td-price");
-      if (priceEl) priceEl.textContent = fmtPrice(el.dataset.priceInr, el.dataset.id);
-    });
-
-    // Any remaining .price-cell in a .coin-row (catches home page if loaded)
-    document.querySelectorAll(".coin-row[data-id]").forEach(function (row) {
-      const el = row.querySelector(".price-cell");
-      if (el) el.textContent = fmtPrice(row.dataset.priceInr, row.dataset.id);
-    });
-  }
-
-
-  /* ══════════════════════════════════════════════════════
-     10. CURRENCY EVENT LISTENER
-     Listens for currencyChanged event fired by main.js.
-     Fetches USD rates if needed, then updates all prices.
-  ══════════════════════════════════════════════════════ */
-  window.addEventListener("currencyChanged", async function (e) {
-    currentCurrency = e.detail.currency;
-    if (currentCurrency === "usd" && !usdFetched) await fetchUSD();
-    updateAllPrices();
-  });
-
-  // Initial check on page load: if preferred currency is USD, fetch rates and update
-  if (currentCurrency === "usd") {
-    (async function () {
-      await fetchUSD();
-      updateAllPrices();
-    })();
-  }
-
-
-  /* ══════════════════════════════════════════════════════
      11. COIN MODAL — quick-view popup
      Clicking any coin row/card opens a bottom-sheet modal
      with price details and a 7-day chart.
   ══════════════════════════════════════════════════════ */
-  const modal         = document.getElementById("coinModal");
+  const modal = document.getElementById("coinModal");
   if (!modal) return;   // no modal on this page, stop here
 
   const closeBtn      = document.getElementById("closeModal");
@@ -774,4 +806,4 @@ document.addEventListener("DOMContentLoaded", function () {
   // Pre-fetch USD rates quietly in background on page load
   fetchUSD();
 
-}); // end DOMContentLoaded
+});

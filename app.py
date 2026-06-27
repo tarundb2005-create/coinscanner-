@@ -320,6 +320,7 @@ TALISMAN_CSP = {
         "https://www.gstatic.com",
         "https://api.coingecko.com",
         "https://api.exchangerate-api.com",
+        "https://public.coindcx.com",
     ],
     "frame-src": [
         "'self'",
