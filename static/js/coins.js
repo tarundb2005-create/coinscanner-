@@ -38,7 +38,7 @@
     // ── Detect active currency ───────────────────────────
     function getActiveCurrency() {
         try {
-            return localStorage.getItem('cs_currency') || 'inr';
+            return localStorage.getItem('preferredCurrency') || 'inr';
         } catch (e) {
             return 'inr';
         }
@@ -63,9 +63,19 @@
     function fmtPrice(val, currency) {
         if (!val || isNaN(val)) return '—';
         const sym = currency === 'usd' ? '$' : '₹';
-        if (val < 0.01) return sym + val.toFixed(6);
-        if (val < 1) return sym + val.toFixed(4);
-        return sym + Number(val).toLocaleString('en-IN', { maximumFractionDigits: 2 });
+        if (currency === 'usd') {
+            const rate = window.usdInrRate || 84.5;
+            val = val / rate;
+        }
+        if (currency === 'usd') {
+            if (val < 0.01) return sym + val.toFixed(6);
+            if (val < 1) return sym + val.toFixed(4);
+            return sym + Number(val).toLocaleString('en-US', { maximumFractionDigits: 2 });
+        } else {
+            if (val < 0.01) return sym + val.toFixed(6);
+            if (val < 1) return sym + val.toFixed(4);
+            return sym + Number(val).toLocaleString('en-IN', { maximumFractionDigits: 2 });
+        }
     }
 
     function fmtMcap(val) {

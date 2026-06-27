@@ -473,19 +473,24 @@ document.addEventListener("DOMContentLoaded", function () {
     )];
     if (!ids.length) return;
 
+    let USDINR = 84.5;
     try {
       const res    = await fetch("https://api.exchangerate-api.com/v4/latest/USD");
-      if (!res.ok) return;
-      const data   = await res.json();
-      const USDINR = data.rates?.INR || 84.5;
-      document.querySelectorAll("[data-price-inr]").forEach(function (el) {
-        const inr = parseFloat(el.dataset.priceInr);
-        if (inr && el.dataset.id) usdRates[el.dataset.id] = inr / USDINR;
-      });
-      usdFetched = true;
+      if (res.ok) {
+        const data   = await res.json();
+        USDINR = data.rates?.INR || 84.5;
+      }
     } catch (e) {
-      console.error("USD fetch error:", e);
+      console.warn("USD fetch error, using fallback rate 84.5:", e);
     }
+
+    document.querySelectorAll("[data-price-inr]").forEach(function (el) {
+      const inr = parseFloat(el.dataset.priceInr);
+      if (inr && el.dataset.id) usdRates[el.dataset.id] = inr / USDINR;
+    });
+    usdFetched = true;
+    window.usdInrRate = USDINR;
+    window.usdRates = usdRates;
   }
 
 
@@ -537,6 +542,14 @@ document.addEventListener("DOMContentLoaded", function () {
     if (currentCurrency === "usd" && !usdFetched) await fetchUSD();
     updateAllPrices();
   });
+
+  // Initial check on page load: if preferred currency is USD, fetch rates and update
+  if (currentCurrency === "usd") {
+    (async function () {
+      await fetchUSD();
+      updateAllPrices();
+    })();
+  }
 
 
   /* ══════════════════════════════════════════════════════

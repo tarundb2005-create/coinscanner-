@@ -319,6 +319,7 @@ TALISMAN_CSP = {
         "https://firebase.googleapis.com",
         "https://www.gstatic.com",
         "https://api.coingecko.com",
+        "https://api.exchangerate-api.com",
     ],
     "frame-src": [
         "'self'",
